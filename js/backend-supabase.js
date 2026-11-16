@@ -12,6 +12,8 @@ const ERRORS = [
   [/rate limit|too many requests|security purposes/i, '操作太頻繁了，請稍等一下再試'],
   [/database error saving new user/i, '註冊失敗：使用者 ID 可能已被使用'],
   [/daily cloud limit/i, '今天上傳到雲端的張數已達上限'],
+  [/schema cache|does not exist|PGRST20[25]|42P01|42883/i, '雲端資料庫還沒設定完成：請先在 Supabase 執行 supabase/schema.sql'],
+  [/invalid api key|no api key/i, '雲端金鑰不正確，請檢查 js/config.js'],
   [/failed to fetch|networkerror|load failed/i, '無法連線到雲端，請檢查網路'],
   [/jwt expired|invalid jwt/i, '登入已過期，請重新登入'],
 ];
