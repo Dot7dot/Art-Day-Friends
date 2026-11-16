@@ -321,7 +321,6 @@ input, textarea { font: inherit; color: var(--ink); }
 .auth-form { display: grid; gap: 14px; }
 .auth-form .btn-block { margin-top: 4px; min-height: 50px; font-size: 16px; }
 .auth-demo { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; }
-.confirm-mail { display: grid; justify-items: center; gap: 10px; text-align: center; padding: 8px 0; }
 
 .rules { list-style: none; margin: 0; padding: 0; width: 100%; max-width: 420px; display: grid; gap: 10px; }
 .rules li { display: flex; gap: 14px; align-items: center; }

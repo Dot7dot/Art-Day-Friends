@@ -48,22 +48,35 @@ Art Day 是一個給藝術家的小日曆：
 1. **建立專案**：到 supabase.com 註冊，New project（免費方案即可，地區可以選 Tokyo 或 Singapore）。
 2. **建立資料表**：左側 **SQL Editor** → New query → 把 [`supabase/schema.sql`](supabase/schema.sql) 的內容整份貼上 → **Run**。
    - 看到 `pg_cron 尚未啟用` 的提示也沒關係。想要自動排程清除的話，到 **Integrations → Cron** 開啟後再執行一次即可。
-3. **設定登入網址**：**Authentication → URL Configuration**
-   - Site URL 填 `https://dot7dot.github.io/Art-Day-Friends/`
-   - （建議）**Authentication → Sign In / Providers → Email** 關掉 **Confirm email**，註冊後就能直接使用；若保持開啟，使用者需先點確認信。
-4. **填入金鑰**：**Project Settings → API**（或 **Data API**），複製 **Project URL** 和 **anon public** key，填進 [`js/config.js`](js/config.js)：
+3. **關閉 Confirm email（必要）**：**Authentication → Sign In / Providers → Email**，把 **Confirm email** 關掉 → Save。
+   - 註冊**不需要信箱**，只要「使用者 ID＋密碼」。App 會在背後用使用者 ID 組出一個收不到信的內部帳號（`使用者ID@users.art-day.invalid`，`.invalid` 是保留網域，不會寄出任何信）。
+   - 如果忘了關，註冊時會出現「請關閉 Confirm email」的提示。關掉之前註冊失敗的帳號，可以到 **Authentication → Users** 刪除，那個使用者 ID 就能重新使用。
+   - 建議到 **Authentication → Rate Limits** 確認註冊頻率有上限，避免有人用程式大量註冊。
+4. **填入金鑰**：**Project Settings → API Keys**，複製 **Project URL** 和 **publishable key**（`sb_publishable_...`，舊版叫 anon public key），填進 [`js/config.js`](js/config.js)：
 
    ```js
-   export const SUPABASE_URL = 'https://xxxxxxxx.supabase.co';
-   export const SUPABASE_ANON_KEY = 'eyJhbGciOi...';
+   export const SUPABASE_URL = 'https://xxxxxxxx.supabase.co';   // 不要加 /rest/v1/
+   export const SUPABASE_ANON_KEY = 'sb_publishable_...';
    ```
 
-   anon key 本來就設計成可以放在前端公開，資料安全由 `schema.sql` 裡的 Row Level Security 規則保護：
+   publishable key 本來就設計成放在前端公開（任何人打開網站都看得到，藏不起來），資料安全由 `schema.sql` 裡的 Row Level Security 規則保護：
    - 只有登入的人能查看使用者 ID 與暱稱。
    - 只有**互相是好友**的人，才看得到彼此**今天**的畫與文字。
    - 每個人只能新增、刪除自己的畫。
 
+   ⚠️ **secret key**（`sb_secret_...`，舊版叫 service_role key）和**資料庫密碼**絕對不要放進 repo，這個網站用不到它們。
+
 5. **推上 GitHub**：commit 並 push 到 `main`，幾分鐘後網站就會更新。
+
+### 忘記密碼
+
+因為沒有綁定信箱，使用者無法自行重設密碼。管理者可以在 Supabase 的 **SQL Editor** 幫忙重設（把 `某人的ID` 和 `新密碼` 換掉）：
+
+```sql
+update auth.users
+   set encrypted_password = extensions.crypt('新密碼', extensions.gen_salt('bf'))
+ where email = '某人的ID@users.art-day.invalid';
+```
 
 ## 發佈到 GitHub Pages
 

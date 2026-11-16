@@ -3,12 +3,19 @@
 
 const LIB = '../vendor/supabase-js-2.117.3.mjs';
 
+// 註冊不需要信箱：Supabase 登入一定要有 email 欄位，所以用「使用者 ID」組出一個
+// 收不到信的內部帳號（.invalid 是保留網域，不會寄出、也不屬於任何人）。
+// Supabase 必須關閉「Confirm email」，見 README。注意：這個網域改了，舊帳號就登入不了。
+const LOGIN_DOMAIN = 'users.art-day.invalid';
+const loginEmail = (username) => `${username.trim().replace(/^@/, '').toLowerCase()}@${LOGIN_DOMAIN}`;
+const NEEDS_AUTOCONFIRM = '雲端設定還差一步：請在 Supabase → Authentication → Sign In / Providers → Email 關閉「Confirm email」';
+
 const ERRORS = [
-  [/invalid login credentials/i, 'Email 或密碼不正確'],
-  [/email not confirmed/i, '請先到信箱點擊確認信，再回來登入'],
-  [/user already registered/i, '這個 Email 已經註冊過了，請直接登入'],
+  [/invalid login credentials/i, '使用者 ID 或密碼不正確'],
+  [/email not confirmed|email address .* is invalid|email_address_invalid|error sending confirmation/i, NEEDS_AUTOCONFIRM],
+  [/user already registered/i, '這個使用者 ID 已經有人用了，換一個吧'],
   [/password should be at least/i, '密碼至少需要 6 個字元'],
-  [/unable to validate email|invalid email|email address .* is invalid/i, 'Email 格式不正確'],
+  [/signups? not allowed/i, '目前沒有開放註冊'],
   [/rate limit|too many requests|security purposes/i, '操作太頻繁了，請稍等一下再試'],
   [/database error saving new user/i, '註冊失敗：使用者 ID 可能已被使用'],
   [/daily cloud limit/i, '今天上傳到雲端的張數已達上限'],
@@ -54,16 +61,14 @@ export async function createSupabaseBackend(url, anonKey) {
     return mapProfile(p);
   }
 
-  async function doSignUp({ email, password, username, displayName }) {
+  async function doSignUp({ password, username, displayName }) {
     const data = check(await sb.auth.signUp({
-      email,
+      email: loginEmail(username),
       password,
-      options: {
-        data: { username: username.toLowerCase(), display_name: displayName },
-        emailRedirectTo: location.origin + location.pathname,
-      },
+      options: { data: { username: username.toLowerCase(), display_name: displayName } },
     }));
-    if (!data.session) return { needsConfirm: true };
+    // 沒拿到登入狀態 = Supabase 還開著「Confirm email」
+    if (!data.session) throw new Error(NEEDS_AUTOCONFIRM);
     me = await loadProfile(data.user);
     return { user: me };
   }
@@ -80,7 +85,7 @@ export async function createSupabaseBackend(url, anonKey) {
       return me;
     },
 
-    /** 登入狀態從別處改變時（例如點了確認信、登入過期）通知 App */
+    /** 登入狀態從別處改變時（例如在別的分頁登出、登入過期）通知 App */
     onAuthChange(cb) {
       sb.auth.onAuthStateChange((event, session) => {
         // 依官方建議，不在 callback 內直接呼叫其他 Supabase API
@@ -98,17 +103,20 @@ export async function createSupabaseBackend(url, anonKey) {
       return check(await sb.rpc('username_available', { name: username.toLowerCase() }));
     },
 
-    async signUp({ email, password, username, displayName }) {
+    async signUp({ password, username, displayName }) {
       authBusy = true;
       try {
-        return await doSignUp({ email, password, username, displayName });
+        return await doSignUp({ password, username, displayName });
       } finally { authBusy = false; }
     },
 
     async signIn({ login, password }) {
       authBusy = true;
       try {
-        const data = check(await sb.auth.signInWithPassword({ email: login.trim(), password }));
+        // 一般輸入使用者 ID；含有 @ 的（例如早期用 email 註冊的帳號）就直接當 email 用
+        const id = login.trim().replace(/^@/, '');
+        const email = id.includes('@') ? id : loginEmail(id);
+        const data = check(await sb.auth.signInWithPassword({ email, password }));
         me = await loadProfile(data.user);
         return me;
       } finally { authBusy = false; }

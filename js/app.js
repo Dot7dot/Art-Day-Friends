@@ -287,17 +287,14 @@ function renderAuth() {
       b.classList.toggle('on', b.dataset.mode === mode);
       b.setAttribute('aria-selected', String(b.dataset.mode === mode));
     });
-    const userAttrs = 'autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="20" required placeholder="例如 momo_draws"';
+    const userAttrs = 'autocomplete="username" autocapitalize="none" spellcheck="false" required placeholder="例如 momo_draws"';
     form.innerHTML = mode === 'signup'
       ? `${field('displayName', '暱稱', 'maxlength="30" required placeholder="朋友看到的名字" autocomplete="nickname"')}
-         ${field('username', '使用者 ID', userAttrs, '3–20 個英文小寫、數字或底線，朋友用它找到你')}
-         ${cloud ? field('email', 'Email', 'type="email" autocomplete="email" required placeholder="you@example.com"') : ''}
-         ${field('password', '密碼', 'type="password" autocomplete="new-password" minlength="6" required placeholder="至少 6 個字元"')}
+         ${field('username', '使用者 ID', `${userAttrs} maxlength="20"`, '3–20 個英文小寫、數字或底線，朋友用它找到你，之後不能修改')}
+         ${field('password', '密碼', 'type="password" autocomplete="new-password" minlength="6" required placeholder="至少 6 個字元"', '不需要信箱，所以忘記密碼無法自行重設，請記好')}
          <p class="form-error" role="alert" hidden></p>
          <button class="btn btn-primary btn-block" type="submit">建立帳號</button>`
-      : `${cloud
-          ? field('email', 'Email', 'type="email" autocomplete="email" required placeholder="you@example.com"')
-          : field('username', '使用者 ID', userAttrs)}
+      : `${field('username', '使用者 ID', userAttrs)}
          ${field('password', '密碼', 'type="password" autocomplete="current-password" required')}
          <p class="form-error" role="alert" hidden></p>
          <button class="btn btn-primary btn-block" type="submit">登入</button>`;
@@ -324,28 +321,18 @@ function renderAuth() {
         const displayName = (fd.displayName || '').trim();
         if (!displayName) return fail('請填寫暱稱');
         if (!/^[a-z0-9_]{3,20}$/.test(username)) return fail('使用者 ID 需為 3–20 個英文小寫、數字或底線');
-        if (cloud && !/^\S+@\S+\.\S+$/.test(fd.email || '')) return fail('請填寫正確的 Email');
         if (password.length < 6) return fail('密碼至少需要 6 個字元');
         setBusy(btn, true, '建立中…');
         if (!(await state.backend.usernameAvailable(username))) { setBusy(btn, false); return fail('這個使用者 ID 已經有人用了，換一個吧'); }
-        const res = await state.backend.signUp({ email: (fd.email || '').trim(), password, username, displayName });
+        const res = await state.backend.signUp({ password, username, displayName });
         localStorage.setItem('artday.hasAccount', '1');
-        if (res.needsConfirm) {
-          form.innerHTML = `<div class="confirm-mail">
-            <div class="empty-art">${icon('check', 30)}</div>
-            <h2>確認信已寄出</h2>
-            <p class="muted">請到 <b>${esc(fd.email)}</b> 點擊信中的連結，完成後回來登入。</p>
-            <button type="button" class="btn btn-block" data-mode-login>回到登入</button></div>`;
-          $('[data-mode-login]', form).addEventListener('click', () => { mode = 'login'; paint(); });
-          return;
-        }
         state.me = res.user;
         toast(`歡迎，${state.me.displayName}！`);
       } else {
-        if (cloud ? !fd.email : !username) return fail(cloud ? '請填寫 Email' : '請填寫使用者 ID');
+        if (!username) return fail('請填寫使用者 ID');
         if (!password) return fail('請填寫密碼');
         setBusy(btn, true, '登入中…');
-        state.me = await state.backend.signIn({ login: cloud ? fd.email : username, password });
+        state.me = await state.backend.signIn({ login: username, password });
         localStorage.setItem('artday.hasAccount', '1');
       }
       render();
