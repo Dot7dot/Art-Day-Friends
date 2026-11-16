@@ -11,8 +11,8 @@
 //  資料安全由資料庫的 Row Level Security 規則保護（見 supabase/schema.sql）。
 // ─────────────────────────────────────────────────────────────
 
-export const SUPABASE_URL = '';        // 例如 'https://abcdefghijk.supabase.co'
-export const SUPABASE_ANON_KEY = '';   // 例如 'eyJhbGciOiJIUzI1NiIsInR5cCI6...'
+export const SUPABASE_URL = 'https://hjslgoxniiysyjnupyri.supabase.co';
+export const SUPABASE_ANON_KEY = 'sb_publishable_HMTOnp6WRu4m8ScjcPTJyw_ukHuK9xi'; // publishable key：可公開
 
 // 每個人每天最多同步到雲端的圖片張數（超過的只存在本機）
 export const MAX_CLOUD_DRAWINGS_PER_DAY = 6;
