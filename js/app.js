@@ -8,6 +8,7 @@ import { icon } from './icons.js';
 import { dayKey, addDays, endOfDay, dayParts, formatDayLong, timeLeftToday, formatTime } from './dates.js';
 import { esc, toast, openModal, confirmDialog, lightbox, avatar, uuid, debounce, copyText, downloadBlob, setBusy } from './ui.js';
 import { openSketchPad } from './sketch.js';
+import { openDrawingModal, commentHtml } from './drawing-modal.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -386,9 +387,65 @@ async function pushDrawing(rec) {
 
 async function removeDrawing(rec) {
   if (rec.day === dayKey() && rec.cloud === 'synced') {
-    await state.backend.deleteDrawing(rec.id); // 先刪雲端，失敗就整個取消
+    await state.backend.deleteDrawing(rec.id); // 先刪雲端（留言也會一起刪），失敗就整個取消
   }
   await archive.deleteDrawing(rec.id);
+  archive.replaceComments(rec.userId, [rec.id], []).catch((e) => console.warn(e));
+}
+
+// ════════════════════════════════════════════════════════════════
+//  留言
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * 讀取這些畫上的留言（陣列，依時間排序）。
+ * mine = 這些是我自己的畫：成功就更新本機快取，失敗就改用快取（離線也看得到）。
+ * 失敗又沒有快取時，回傳的陣列會帶 failed = true。
+ */
+async function loadComments(ids, { mine = false } = {}) {
+  const me = state.me;
+  if (!ids.length) return [];
+  try {
+    const list = await state.backend.fetchComments(ids);
+    if (mine) archive.replaceComments(me.id, ids, list).catch((e) => console.warn(e));
+    return list;
+  } catch (e) {
+    console.warn('comments unavailable', e);
+    const cached = mine ? await archive.commentsOfDrawings(ids).catch(() => []) : [];
+    return Object.assign(cached, { failed: !cached.length });
+  }
+}
+
+const countBy = (list) => {
+  const m = new Map();
+  for (const c of list) m.set(c.drawingId, (m.get(c.drawingId) || 0) + 1);
+  return m;
+};
+
+/** mine = 在自己的畫上（會同步本機快取） */
+function commentActions(mine) {
+  const me = state.me;
+  return {
+    load: (id) => loadComments([id], { mine }),
+    async add(id, body) {
+      const c = await state.backend.addComment(id, body);
+      if (mine) archive.putComment(me.id, c).catch((e) => console.warn(e));
+      return c;
+    },
+    async remove(c) {
+      await state.backend.deleteComment(c.id);
+      if (mine) archive.deleteComment(c.id).catch((e) => console.warn(e));
+    },
+  };
+}
+
+const cmtBadge = (id, n = 0, always = false) => `<span class="cmt-badge" data-cmt="${esc(id)}" ${n || always ? '' : 'hidden'}>${icon('chat', 14)}<span>${n || ''}</span></span>`;
+
+function setCmtBadge(root, id, n, always = false) {
+  const el = root.querySelector(`[data-cmt="${CSS.escape(id)}"]`);
+  if (!el) return;
+  el.hidden = !n && !always;
+  el.lastElementChild.textContent = n || '';
 }
 
 /** 同步今天：重試未上傳的、把別台裝置今天上傳的抓回本機 */
@@ -483,6 +540,18 @@ async function viewToday(el, c) {
   c.every(tickChip, 30_000);
 
   let drawings = [];
+  let counts = new Map();
+
+  /** 好友留在我今天的畫上的留言數 */
+  async function refreshCounts() {
+    const ids = drawings.filter((d) => d.cloud === 'synced').map((d) => d.id);
+    if (!ids.length || !c.alive) return;
+    const list = await loadComments(ids, { mine: true });
+    if (!c.alive) return;
+    counts = countBy(list);
+    for (const id of ids) setCmtBadge(grid, id, counts.get(id) || 0);
+  }
+
   async function paintGrid() {
     drawings = await archive.drawingsOfDay(me.id, day);
     if (!c.alive) return;
@@ -495,6 +564,7 @@ async function viewToday(el, c) {
         <button class="tile-img" data-view="${d.id}" aria-label="查看 ${formatTime(d.createdAt)} 的畫">
           <img src="${c.url(d.thumb || d.blob)}" alt="">
         </button>
+        ${d.cloud === 'synced' ? cmtBadge(d.id, counts.get(d.id) || 0) : ''}
         ${d.cloud === 'pending'
           ? `<button class="badge ${s.cls}" data-retry="${d.id}">${icon(s.ico, 14)}<span>${s.text}</span></button>`
           : `<span class="badge ${s.cls}">${icon(s.ico, 14)}<span>${s.text}</span></span>`}
@@ -540,8 +610,15 @@ async function viewToday(el, c) {
     } else if (t.dataset.view) {
       const d = drawings.find((x) => x.id === t.dataset.view);
       if (!d) return;
-      lightbox(c.url(d.blob), {
-        caption: `今天 ${formatTime(d.createdAt)}`,
+      openDrawingModal({
+        title: `今天 ${formatTime(d.createdAt)}`,
+        src: c.url(d.blob),
+        alt: '我今天的畫',
+        drawingId: d.cloud === 'synced' ? d.id : null,
+        me,
+        isOwner: true,
+        actions: commentActions(true),
+        onCount: (n) => { counts.set(d.id, n); setCmtBadge(grid, d.id, n); },
         onDownload: () => downloadBlob(d.blob, `art-day-${d.day}-${formatTime(d.createdAt).replace(':', '')}.jpg`),
       });
     } else if (t.dataset.retry) {
@@ -602,11 +679,13 @@ async function viewToday(el, c) {
 
   await paintGrid();
   grow();
+  refreshCounts();
+  c.every(refreshCounts, 30_000);
 
   // 背景同步
   syncToday().then(({ changed, note }) => {
     if (!c.alive) return;
-    if (changed) paintGrid();
+    if (changed) paintGrid().then(refreshCounts);
     if (note && !noteEl.value && document.activeElement !== noteEl) { noteEl.value = note; grow(); }
   }).catch((e) => console.warn('sync failed', e));
 }
@@ -679,9 +758,26 @@ async function paintFeed(body, c) {
     if (!b) return;
     const img = $('img', b);
     if (!img?.src) return;
-    const d = images.get(b.dataset.cloudView);
-    lightbox(img.src, { caption: `${d?.who || ''} · 今天 ${d ? formatTime(d.createdAt) : ''}` });
+    const id = b.dataset.cloudView;
+    const d = images.get(id);
+    openDrawingModal({
+      title: `${d?.who || ''} · 今天 ${d ? formatTime(d.createdAt) : ''}`,
+      src: img.src,
+      alt: `${d?.who || ''} 今天的畫`,
+      drawingId: id,
+      me: state.me,
+      isOwner: false,
+      actions: commentActions(false),
+      onCount: (n) => setCmtBadge(body, id, n, true),
+    });
   };
+
+  // 各張畫的留言數（不擋住圖片載入；留言功能還沒設定好時就安靜略過）
+  loadComments([...images.keys()]).then((list) => {
+    if (!c.alive || list.failed) return;
+    const counts = countBy(list);
+    for (const id of images.keys()) setCmtBadge(body, id, counts.get(id) || 0, true);
+  });
 
   // 逐張載入圖片（一次最多 3 張）
   const queue = $$('img[data-cloud-id]', body);
@@ -710,9 +806,10 @@ function postCard(p) {
       <div class="post-who"><b>${esc(p.profile.displayName)}</b><span class="muted small">@${esc(p.profile.username)} · ${meta}</span></div>
     </header>
     ${n ? `<div class="post-grid ${single ? 'single' : ''}">
-      ${p.drawings.map((d) => `<button class="post-img" data-cloud-view="${esc(d.id)}" aria-label="查看大圖"
+      ${p.drawings.map((d) => `<button class="post-img" data-cloud-view="${esc(d.id)}" aria-label="查看大圖與留言"
           ${single && d.width && d.height ? `style="aspect-ratio:${d.width}/${d.height}"` : ''}>
           <img data-cloud-id="${esc(d.id)}" alt="${esc(p.profile.displayName)} 今天的畫">
+          ${cmtBadge(d.id, 0, true)}
         </button>`).join('')}
     </div>` : ''}
     ${p.note ? `<p class="post-note">${esc(p.note)}</p>` : ''}
@@ -976,6 +1073,7 @@ async function openDaySheet(day) {
               <button class="icon-btn small" data-rm="${i}" aria-label="刪除">${icon('trash', 18)}</button>
             </span>
           </figcaption>
+          <ul class="comment-list compact sheet-comments" data-cmts="${esc(d.id)}" aria-label="好友的留言" hidden></ul>
         </figure>`).join('')}</div>` : ''}
       ${note ? `<div class="sheet-note"><p class="eyebrow">文字記錄</p><p>${esc(note)}</p></div>` : ''}
       ${isToday ? `<div class="modal-foot"><a class="btn btn-primary" href="#/today" data-close>${icon('pen', 18)}<span>到「今天」編輯</span></a></div>` : ''}`,
@@ -984,6 +1082,20 @@ async function openDaySheet(day) {
       if (changed && parseRoute().name === 'calendar') render();
     },
   });
+
+  // 好友在這些畫上留的字：先用本機快取，再向雲端更新（沒有留言就什麼都不顯示）
+  const paintSheetComments = (all) => {
+    for (const ul of $$('[data-cmts]', m.body)) {
+      const mine = all.filter((x) => x.drawingId === ul.dataset.cmts);
+      ul.innerHTML = mine.map((x) => commentHtml(x, { compact: true })).join('');
+      ul.hidden = !mine.length;
+    }
+  };
+  if (list.length) {
+    const ids = list.map((d) => d.id);
+    archive.commentsOfDrawings(ids).then(paintSheetComments).catch(() => {});
+    loadComments(ids, { mine: true }).then((all) => { if (!all.failed) paintSheetComments(all); });
+  }
 
   m.body.addEventListener('click', async (e) => {
     const b = e.target.closest('button');

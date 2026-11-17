@@ -9,6 +9,7 @@ import { demoArt } from './demo-art.js';
 const K_USERS = 'artday.demo.users';
 const K_SESSION = 'artday.demo.session';
 const K_FRIENDS = 'artday.demo.friendships';
+const K_CANNED = 'artday.demo.cannedComments'; // 示範好友已經留過言的畫（每張只留一次）
 
 const DEMO_ARTISTS = [
   {
@@ -28,6 +29,16 @@ const DEMO_ARTISTS = [
   },
 ];
 
+const CANNED_COMMENTS = [
+  '好喜歡這張的色彩！',
+  '線條好有質感，今天也辛苦了～',
+  '看了心情變好，謝謝你分享！',
+  '這張好可愛，我要偷學一下構圖。',
+  '好溫柔的畫，明天也想看到你的新作！',
+];
+const COMMENT_MAX = 200;
+const COMMENT_CAP = 30;
+
 const read = (k, fallback) => {
   try { return JSON.parse(localStorage.getItem(k)) ?? fallback; } catch { return fallback; }
 };
@@ -41,9 +52,13 @@ async function sha256(text) {
 const randomHex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
 
 export async function createLocalBackend() {
-  const cloud = openDB('artday-demo-cloud', 1, (d) => {
-    d.createObjectStore('drawings', { keyPath: 'id' }).createIndex('byUser', 'userId');
-    d.createObjectStore('notes', { keyPath: ['userId', 'day'] });
+  const cloud = openDB('artday-demo-cloud', 2, (d, oldVersion) => {
+    if (oldVersion < 1) {
+      d.createObjectStore('drawings', { keyPath: 'id' }).createIndex('byUser', 'userId');
+      d.createObjectStore('notes', { keyPath: ['userId', 'day'] });
+    }
+    // 留言不跟著畫一起清除（和真正的雲端版一樣）
+    if (oldVersion < 2) d.createObjectStore('comments', { keyPath: 'id' }).createIndex('byDrawing', 'drawingId');
   });
 
   // 確保示範好友存在
@@ -90,6 +105,34 @@ export async function createLocalBackend() {
       ds.filter((d) => d.expiresAt <= now).forEach((d) => drawings.delete(d.id));
       ns.filter((x) => x.expiresAt <= now).forEach((x) => notes.delete([x.userId, x.day]));
     });
+  }
+
+  const hashStr = (str) => [...str].reduce((h, ch) => (h * 31 + ch.codePointAt(0)) >>> 0, 7);
+  const getDrawing = (id) => run(cloud, 'drawings', 'readonly', ({ drawings }) => promisify(drawings.get(id)));
+  const isFriend = (a, b) => friendships().some((f) => f.status === 'accepted'
+    && ((f.requester === a && f.addressee === b) || (f.requester === b && f.addressee === a)));
+  const pubComment = (c) => ({
+    id: c.id, drawingId: c.drawingId, day: c.day, body: c.body, createdAt: c.createdAt,
+    author: byId(c.author) || { id: c.author, username: '', displayName: '已離開的朋友' },
+  });
+  const putCloudComment = (c) => run(cloud, 'comments', 'readwrite', ({ comments }) => promisify(comments.put(c)));
+
+  /** 示範：我的好友裡的示範畫家，會在我今天的每張畫上各留一句話（每張只留一次） */
+  async function ensureCannedComments(drawings) {
+    const artists = DEMO_ARTISTS.filter((a) => isFriend(a.id, me.id));
+    if (!artists.length) return;
+    const done = new Set(read(K_CANNED, []));
+    for (const d of drawings) {
+      if (done.has(d.id)) continue;
+      const h = hashStr(d.id);
+      const a = artists[h % artists.length];
+      done.add(d.id);
+      await putCloudComment({
+        id: `demo-c-${d.id}`, drawingId: d.id, drawingOwner: me.id, author: a.id, day: d.day,
+        body: CANNED_COMMENTS[(h >>> 3) % CANNED_COMMENTS.length], createdAt: nowIso(),
+      });
+    }
+    write(K_CANNED, [...done]);
   }
 
   const api = {
@@ -197,10 +240,57 @@ export async function createLocalBackend() {
       await run(cloud, 'drawings', 'readwrite', ({ drawings }) => promisify(drawings.put({
         id, userId: me.id, day, image, width, height, createdAt: nowIso(), expiresAt,
       })));
+      // 讓示範更有感：過幾秒，示範好友就會來留言
+      const owner = me.id;
+      setTimeout(() => {
+        if (me?.id === owner) getDrawing(id).then((d) => d && ensureCannedComments([d])).catch(() => {});
+      }, 4000);
     },
 
     async deleteDrawing(id) {
-      await run(cloud, 'drawings', 'readwrite', ({ drawings }) => promisify(drawings.delete(id)));
+      await run(cloud, ['drawings', 'comments'], 'readwrite', async ({ drawings, comments }) => {
+        const d = await promisify(drawings.get(id));
+        if (d && d.userId !== me.id) throw new Error('只能刪除自己的畫');
+        for (const c of await promisify(comments.index('byDrawing').getAll(id))) comments.delete(c.id);
+        drawings.delete(id);
+      });
+    },
+
+    // ── 留言：規則與真正的雲端版（RLS）一致 ──
+
+    async fetchComments(drawingIds) {
+      const ids = [...new Set(drawingIds)];
+      const [lists, live] = await Promise.all([
+        run(cloud, 'comments', 'readonly', ({ comments }) =>
+          Promise.all(ids.map((id) => promisify(comments.index('byDrawing').getAll(id))))),
+        Promise.all(ids.map(async (id) => { const d = await getDrawing(id); return [id, !!d && d.expiresAt > nowIso()]; })),
+      ]);
+      const isLive = new Map(live);
+      return lists.flat()
+        .filter((c) => c.drawingOwner === me.id || c.author === me.id
+          || (isFriend(c.drawingOwner, me.id) && isLive.get(c.drawingId)))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+        .map(pubComment);
+    },
+
+    async addComment(drawingId, body) {
+      body = String(body ?? '').trim();
+      if (!body || body.length > COMMENT_MAX) throw new Error(`留言需要 1–${COMMENT_MAX} 個字`);
+      const d = await getDrawing(drawingId);
+      if (!d || d.expiresAt <= nowIso()) throw new Error('這張畫已經過了今天，不能再留言了');
+      if (d.userId !== me.id && !isFriend(d.userId, me.id)) throw new Error('只有好友可以在今天的畫上留言');
+      const mine = await run(cloud, 'comments', 'readonly', ({ comments }) => promisify(comments.index('byDrawing').getAll(drawingId)));
+      if (mine.filter((c) => c.author === me.id).length >= COMMENT_CAP) throw new Error('你在這張畫上的留言已經太多了，先到這裡吧');
+      const c = { id: `c-${randomHex(8)}`, drawingId, drawingOwner: d.userId, author: me.id, day: d.day, body, createdAt: nowIso() };
+      await putCloudComment(c);
+      return pubComment(c);
+    },
+
+    async deleteComment(id) {
+      await run(cloud, 'comments', 'readwrite', async ({ comments }) => {
+        const c = await promisify(comments.get(id));
+        if (c && (c.author === me.id || c.drawingOwner === me.id)) comments.delete(id);
+      });
     },
 
     async saveNote({ day, note, expiresAt }) {
@@ -215,9 +305,10 @@ export async function createLocalBackend() {
         promisify(drawings.index('byUser').getAll(me.id)),
         promisify(notes.get([me.id, day])),
       ]));
+      const live = ds.filter((d) => d.day === day && d.expiresAt > now);
+      await ensureCannedComments(live);
       return {
-        drawings: ds.filter((d) => d.day === day && d.expiresAt > now)
-          .map(({ id, width, height, createdAt }) => ({ id, width, height, createdAt })),
+        drawings: live.map(({ id, width, height, createdAt }) => ({ id, width, height, createdAt })),
         note: n && n.expiresAt > now ? n.note : '',
       };
     },

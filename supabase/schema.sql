@@ -9,6 +9,7 @@
 --  • 每筆雲端資料都有 expires_at（上傳者當地的「今天結束」時間），
 --    過期後好友就讀不到（RLS 擋住），並由排程／App 自動刪除。
 --  • 只有互相是好友（accepted）的人，才看得到對方今天的畫與文字。
+--  • 好友可以在今天的畫上留言；留言是很小的純文字，永久保留給畫的主人。
 -- ════════════════════════════════════════════════════════════════
 
 
@@ -297,7 +298,105 @@ create trigger day_notes_guard
   for each row execute function public.guard_note();
 
 
--- ── 5. 自動清除過期資料 ──────────────────────────────────────────
+-- ── 5. 畫的留言（永久保留，不跟著畫一起刪除）──────────────────────────
+--  • 好友可以在「還沒過期」的畫上留言；畫的主人能永遠看到所有留言。
+--  • drawing_id 刻意不設外鍵：畫過了今天就會被清掉，留言要留下來。
+--  • drawing_owner、day 由觸發器從畫本身複製，前端無法偽造。
+create table if not exists public.drawing_comments (
+  id            uuid primary key default gen_random_uuid(),
+  drawing_id    uuid not null,
+  drawing_owner uuid not null references public.profiles (id) on delete cascade,
+  author        uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  day           date not null,
+  body          text not null check (char_length(body) between 1 and 200),
+  created_at    timestamptz not null default now()
+);
+
+create index if not exists drawing_comments_drawing_idx on public.drawing_comments (drawing_id, created_at);
+create index if not exists drawing_comments_owner_idx on public.drawing_comments (drawing_owner, day);
+
+alter table public.drawing_comments enable row level security;
+
+-- 這張畫還沒過期嗎？（給 RLS 用，不受 drawings 的讀取規則影響）
+create or replace function public.drawing_is_live(d uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (select 1 from public.drawings where id = d and expires_at > now());
+$$;
+
+revoke execute on function public.drawing_is_live(uuid) from public, anon;
+grant execute on function public.drawing_is_live(uuid) to authenticated;
+
+-- 誰看得到：畫的主人與留言者（永遠）；主人的好友（只在畫還沒過期時）
+drop policy if exists "comments: owner, author, or friends while live" on public.drawing_comments;
+create policy "comments: owner, author, or friends while live" on public.drawing_comments
+  for select to authenticated
+  using (
+    drawing_owner = (select auth.uid())
+    or author = (select auth.uid())
+    or (public.is_my_friend(drawing_owner) and public.drawing_is_live(drawing_id))
+  );
+
+-- 誰能留言：作者必須是自己；畫還沒過期；畫的主人本人或主人的好友
+drop policy if exists "comments: insert as friend or owner" on public.drawing_comments;
+create policy "comments: insert as friend or owner" on public.drawing_comments
+  for insert to authenticated
+  with check (
+    author = (select auth.uid())
+    and public.drawing_is_live(drawing_id)
+    and (drawing_owner = (select auth.uid()) or public.is_my_friend(drawing_owner))
+  );
+
+-- 留言不能修改；留言者或畫的主人可以刪除
+drop policy if exists "comments: delete own or on own drawing" on public.drawing_comments;
+create policy "comments: delete own or on own drawing" on public.drawing_comments
+  for delete to authenticated
+  using (author = (select auth.uid()) or drawing_owner = (select auth.uid()));
+
+revoke all on public.drawing_comments from anon;
+revoke update on public.drawing_comments from authenticated;
+grant select, insert, delete on public.drawing_comments to authenticated;
+
+-- 寫入時把關：從畫複製 drawing_owner / day、畫必須還沒過期、每人每張畫最多 30 則
+create or replace function public.guard_comment()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  d public.drawings%rowtype;
+begin
+  select * into d from public.drawings where id = new.drawing_id;
+  if not found or d.expires_at <= now() then
+    raise exception 'drawing is not live';
+  end if;
+  new.drawing_owner := d.user_id;
+  new.day := d.day;
+  new.created_at := now();
+  new.body := btrim(new.body);
+  if (select count(*) from public.drawing_comments c
+       where c.drawing_id = new.drawing_id and c.author = new.author) >= 30 then
+    raise exception 'comment limit reached';
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.guard_comment() from public, anon;
+
+drop trigger if exists drawing_comments_guard on public.drawing_comments;
+create trigger drawing_comments_guard
+  before insert on public.drawing_comments
+  for each row execute function public.guard_comment();
+
+
+-- ── 6. 自動清除過期資料 ──────────────────────────────────────────
+-- 只清畫與當天文字；留言（drawing_comments）刻意不清，畫的主人要永遠看得到。
 create or replace function public.purge_expired()
 returns integer
 language plpgsql
