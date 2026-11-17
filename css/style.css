@@ -548,6 +548,65 @@ button.cal-cell:hover { transform: translateY(-2px); border-color: var(--line); 
 }
 .sheet-note p:last-child { margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
 
+/* ── 留言 ─────────────────────────────────────────── */
+
+.cmt-badge {
+  position: absolute; left: 8px; bottom: 8px;
+  display: inline-flex; align-items: center; gap: 4px;
+  height: 26px; padding: 0 9px; border-radius: var(--pill);
+  background: rgba(255, 255, 255, .94); border: var(--lw) solid var(--line-soft);
+  font-size: 12px; font-weight: 800; color: var(--orange-ink); pointer-events: none;
+}
+.cmt-badge[hidden] { display: none; }
+.cmt-badge > span:empty { display: none; }
+.tile .cmt-badge { top: 8px; bottom: auto; }
+
+.modal-drawing { display: flex; flex-direction: column; overflow: hidden; }
+.modal-drawing .modal-head { flex: none; }
+.modal-drawing .modal-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.drawing-detail { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.drawing-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-bottom: 8px; }
+.drawing-fig { margin: 0; display: grid; place-items: center; }
+.drawing-fig img {
+  display: block; max-width: 100%; max-height: min(44dvh, 520px); object-fit: contain;
+  border: var(--lw) solid var(--line-soft); border-radius: var(--r); background: var(--paper);
+}
+.drawing-tools { display: flex; justify-content: flex-end; margin-top: 10px; }
+
+.comments { margin-top: 18px; }
+.comments-title { font-size: 15px; margin-bottom: 8px; }
+.comment-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.comment { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; }
+.comment + .comment { border-top: var(--lw) solid var(--line-soft); }
+.comment-main { flex: 1; min-width: 0; }
+.comment-meta { display: flex; align-items: baseline; gap: 8px; line-height: 1.4; }
+.comment-meta b { font-size: 14px; overflow-wrap: anywhere; }
+.comment-body { margin-top: 2px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); line-height: 1.6; }
+.comment .icon-btn { margin-top: -2px; }
+.comment-empty { list-style: none; padding: 14px 0; text-align: center; font-size: 14px; }
+
+.comment-form {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding-top: 12px; border-top: var(--lw) solid var(--line-soft);
+}
+.comment-form input {
+  flex: 1; min-width: 0; height: 44px; padding: 0 16px;
+  border: var(--lw) solid var(--line-soft); border-radius: var(--pill); background: var(--bg); outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.comment-form input:focus { border-color: var(--orange); box-shadow: 0 0 0 4px rgba(242, 153, 74, .16); }
+.comment-form .btn { height: 44px; padding: 0 16px; }
+.comment-form .btn:disabled { opacity: .45; }
+.comment-left { font-size: 12px; font-weight: 800; color: var(--orange-ink); min-width: 22px; text-align: right; }
+.comment-left[hidden] { display: none; }
+
+/* 日曆當天：畫下面的留言（唯讀） */
+.sheet-comments { gap: 0; margin-top: 2px; }
+.sheet-comments[hidden] { display: none; }
+.comment.compact { padding: 6px 0 6px 10px; border-left: 3px solid var(--line); }
+.comment.compact + .comment.compact { border-top: 0; }
+.comment.compact .comment-body { font-size: 14px; }
+
 /* ── 我的 ─────────────────────────────────────────── */
 
 .profile-card { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }

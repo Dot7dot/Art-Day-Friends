@@ -19,6 +19,8 @@ const ERRORS = [
   [/rate limit|too many requests|security purposes/i, '操作太頻繁了，請稍等一下再試'],
   [/database error saving new user/i, '註冊失敗：使用者 ID 可能已被使用'],
   [/daily cloud limit/i, '今天上傳到雲端的張數已達上限'],
+  [/drawing is not live/i, '這張畫已經過了今天，不能再留言了'],
+  [/comment limit/i, '你在這張畫上的留言已經太多了，先到這裡吧'],
   [/schema cache|does not exist|PGRST20[25]|42P01|42883/i, '雲端資料庫還沒設定完成：請先在 Supabase 執行 supabase/schema.sql'],
   [/invalid api key|no api key/i, '雲端金鑰不正確，請檢查 js/config.js'],
   [/failed to fetch|networkerror|load failed/i, '無法連線到雲端，請檢查網路'],
@@ -36,7 +38,15 @@ function check({ data, error }) {
   return data;
 }
 
+const COMMENT_COLS = 'id, drawing_id, day, body, created_at, author';
+const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+
 const mapProfile = (p) => p && { id: p.id, username: p.username, displayName: p.display_name };
+
+const mapComment = (r, author) => ({
+  id: r.id, drawingId: r.drawing_id, day: r.day, body: r.body, createdAt: r.created_at,
+  author: author || { id: r.author, username: '', displayName: '已離開的朋友' },
+});
 
 export async function createSupabaseBackend(url, anonKey) {
   const { createClient } = await import(LIB);
@@ -187,7 +197,42 @@ export async function createSupabaseBackend(url, anonKey) {
     },
 
     async deleteDrawing(id) {
+      // 留言跟著畫一起刪（畫的主人可以刪掉自己畫上的所有留言）；先刪留言，失敗就整個取消
+      check(await sb.from('drawing_comments').delete().eq('drawing_id', id));
       check(await sb.from('drawings').delete().eq('id', id).eq('user_id', me.id));
+    },
+
+    // ── 留言（永久保存在雲端，不會跟著畫一起被清除）──
+
+    /** 這些畫上看得到的留言（依時間由舊到新） */
+    async fetchComments(drawingIds) {
+      const ids = [...new Set(drawingIds)];
+      if (!ids.length) return [];
+      const rows = [];
+      for (const part of chunk(ids, 40)) {
+        rows.push(...check(await sb.from('drawing_comments').select(COMMENT_COLS)
+          .in('drawing_id', part).order('created_at').limit(1000)));
+      }
+      const authorIds = [...new Set(rows.map((r) => r.author))];
+      const byId = new Map();
+      for (const part of chunk(authorIds, 80)) {
+        for (const p of check(await sb.from('profiles').select('id, username, display_name').in('id', part))) byId.set(p.id, mapProfile(p));
+      }
+      return rows.map((r) => mapComment(r, byId.get(r.author)));
+    },
+
+    async addComment(drawingId, body) {
+      const { data, error } = await sb.from('drawing_comments').insert({ drawing_id: drawingId, body })
+        .select(COMMENT_COLS).single();
+      if (error) {
+        if (error.code === '42501') throw Object.assign(new Error('只有好友可以在今天的畫上留言'), { cause: error });
+        throw friendly(error);
+      }
+      return mapComment(data, me);
+    },
+
+    async deleteComment(id) {
+      check(await sb.from('drawing_comments').delete().eq('id', id));
     },
 
     async saveNote({ day, note, expiresAt }) {

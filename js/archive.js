@@ -5,10 +5,18 @@ import { openDB, promisify, run } from './idb.js';
 
 let dbp;
 function db() {
-  dbp ||= openDB('artday-archive', 1, (d) => {
-    const drawings = d.createObjectStore('drawings', { keyPath: 'id' });
-    drawings.createIndex('byUserDay', ['userId', 'day']);
-    d.createObjectStore('notes', { keyPath: ['userId', 'day'] });
+  dbp ||= openDB('artday-archive', 2, (d, oldVersion) => {
+    if (oldVersion < 1) {
+      const drawings = d.createObjectStore('drawings', { keyPath: 'id' });
+      drawings.createIndex('byUserDay', ['userId', 'day']);
+      d.createObjectStore('notes', { keyPath: ['userId', 'day'] });
+    }
+    if (oldVersion < 2) {
+      // 好友留在我的畫上的留言（雲端永久保存，這裡留一份，離線也看得到）
+      const comments = d.createObjectStore('comments', { keyPath: 'id' });
+      comments.createIndex('byDrawing', 'drawingId');
+      comments.createIndex('byUserDay', ['userId', 'day']);
+    }
   });
   return dbp;
 }
@@ -74,6 +82,45 @@ export function notesInRange(userId, from, to) {
   return run(db(), 'notes', 'readonly', ({ notes }) => promisify(notes.getAll(range(userId, from, to))));
 }
 
+// ── 留言（別人留在「我的畫」上的字）──────────────────
+
+const plainComment = (userId, c) => ({
+  id: c.id, drawingId: c.drawingId, userId, day: c.day, author: c.author, body: c.body, createdAt: c.createdAt,
+});
+
+/** 以雲端最新的結果覆蓋這些畫的留言快取（雲端已刪除的留言也會從快取消失） */
+export function replaceComments(userId, drawingIds, comments) {
+  return run(db(), 'comments', 'readwrite', async ({ comments: store }) => {
+    const ids = new Set(drawingIds);
+    for (const id of ids) {
+      const keys = await promisify(store.index('byDrawing').getAllKeys(id));
+      keys.forEach((k) => store.delete(k));
+    }
+    for (const c of comments) if (ids.has(c.drawingId)) store.put(plainComment(userId, c));
+  });
+}
+
+export function putComment(userId, comment) {
+  return run(db(), 'comments', 'readwrite', ({ comments }) => promisify(comments.put(plainComment(userId, comment))));
+}
+
+export function deleteComment(id) {
+  return run(db(), 'comments', 'readwrite', ({ comments }) => promisify(comments.delete(id)));
+}
+
+/** 這些畫的本機留言快取，依時間排序 */
+export function commentsOfDrawings(drawingIds) {
+  return run(db(), 'comments', 'readonly', async ({ comments }) => {
+    const lists = await Promise.all(drawingIds.map((id) => promisify(comments.index('byDrawing').getAll(id))));
+    return lists.flat().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  });
+}
+
+export function commentsInRange(userId, from, to) {
+  return run(db(), 'comments', 'readonly', ({ comments }) =>
+    promisify(comments.index('byUserDay').getAll(range(userId, from, to))));
+}
+
 // ── 統計 ─────────────────────────────────────────
 
 /** 回傳 { drawingDays:Set, noteDays:Set, drawingCount } */
@@ -110,9 +157,10 @@ const blobToDataURL = (blob) => new Promise((resolve, reject) => {
 });
 
 export async function exportArchive(user) {
-  const [drawings, notes] = await Promise.all([
+  const [drawings, notes, comments] = await Promise.all([
     drawingsInRange(user.id, LOW, HIGH),
     notesInRange(user.id, LOW, HIGH),
+    commentsInRange(user.id, LOW, HIGH),
   ]);
   drawings.sort(byCreated);
   const out = [];
@@ -126,6 +174,7 @@ export async function exportArchive(user) {
     app: 'art-day', version: 1, exportedAt: new Date().toISOString(),
     username: user.username,
     notes: notes.map((n) => ({ day: n.day, text: n.text, updatedAt: n.updatedAt })),
+    comments: comments.map((c) => ({ id: c.id, drawingId: c.drawingId, day: c.day, author: c.author, body: c.body, createdAt: c.createdAt })),
     drawings: out,
   };
 }
@@ -152,6 +201,10 @@ export async function importArchive(userId, data, { makeThumb, dataURLToBlob }) 
     if (!/^\d{4}-\d{2}-\d{2}$/.test(n.day) || typeof n.text !== 'string') continue;
     const current = await getNote(userId, n.day);
     if (!current) await putNote(userId, n.day, n.text);
+  }
+  for (const c of data.comments || []) {
+    if (!c.id || !c.drawingId || !/^\d{4}-\d{2}-\d{2}$/.test(c.day) || typeof c.body !== 'string' || !c.author) continue;
+    await putComment(userId, { ...c, body: c.body.slice(0, 200) });
   }
   return added;
 }
