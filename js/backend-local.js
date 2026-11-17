@@ -27,6 +27,22 @@ const DEMO_ARTISTS = [
     notes: ['補畫昨天想到的點子。', '今天畫得很慢，但很喜歡。'],
     posts: (day) => Number(day.slice(-2)) % 2 === 0,
   },
+  {
+    id: 'demo-nana', username: 'nana_paint', displayName: '娜娜', themes: [2, 1],
+    notes: ['今天試了水彩暈染。', '用咖啡漬當底色，意外好看。', '小小的一張，慢慢畫。'],
+    posts: (day) => Number(day.slice(-2)) % 3 !== 0,
+  },
+  {
+    id: 'demo-kai', username: 'kai_ink', displayName: '阿凱', themes: [0, 1],
+    notes: ['黑色墨水加一點橘色。', '午休十分鐘塗鴉。'],
+    posts: (day) => Number(day.slice(-2)) % 2 === 1,
+  },
+];
+
+// 示範畫家彼此之間本來就是好友，這樣你加了其中一位之後，就會看到「共同好友」的推薦
+const DEMO_LINKS = [
+  ['demo-momo', 'demo-ashu'], ['demo-momo', 'demo-lin'], ['demo-momo', 'demo-nana'],
+  ['demo-ashu', 'demo-lin'], ['demo-ashu', 'demo-nana'], ['demo-lin', 'demo-kai'],
 ];
 
 const CANNED_COMMENTS = [
@@ -64,9 +80,19 @@ export async function createLocalBackend() {
   // 確保示範好友存在
   const users = read(K_USERS, []);
   for (const a of DEMO_ARTISTS) {
-    if (!users.some((u) => u.id === a.id)) users.push({ id: a.id, username: a.username, displayName: a.displayName, demo: true });
+    if (!users.some((u) => u.id === a.id)) users.push({ id: a.id, username: a.username, displayName: a.displayName, demo: true, createdAt: `2024-01-0${DEMO_ARTISTS.indexOf(a) + 1}T00:00:00.000Z` });
   }
   write(K_USERS, users);
+  {
+    const list = read(K_FRIENDS, []);
+    let changed = false;
+    for (const [a, b] of DEMO_LINKS) {
+      if (list.some((f) => (f.requester === a && f.addressee === b) || (f.requester === b && f.addressee === a))) continue;
+      list.push({ requester: a, addressee: b, status: 'accepted', createdAt: '2024-01-01T00:00:00.000Z' });
+      changed = true;
+    }
+    if (changed) write(K_FRIENDS, list);
+  }
 
   let me = null;
   const allUsers = () => read(K_USERS, []);
@@ -224,6 +250,30 @@ export async function createLocalBackend() {
       list.push({ requester: me.id, addressee: targetId, status: target.demo ? 'accepted' : 'pending', createdAt: nowIso() });
       write(K_FRIENDS, list);
       return target.demo ? 'accepted' : 'requested';
+    },
+
+    /** 推薦好友：共同好友多的在前，不夠再用最近加入的補滿（規則同雲端版 suggest_friends） */
+    async suggestFriends(limit = 8) {
+      const lim = Math.min(Math.max(Number(limit) || 8, 1), 20);
+      const all = friendships();
+      const other = (f, id) => (f.requester === id ? f.addressee : f.requester);
+      const mine = new Set(all.filter((f) => f.requester === me.id || f.addressee === me.id).map((f) => other(f, me.id)));
+      const myFriends = new Set(all.filter((f) => f.status === 'accepted' && (f.requester === me.id || f.addressee === me.id)).map((f) => other(f, me.id)));
+      const mutual = new Map();
+      for (const f of all) {
+        if (f.status !== 'accepted') continue;
+        for (const [x, y] of [[f.requester, f.addressee], [f.addressee, f.requester]]) {
+          if (myFriends.has(x) && y !== me.id) mutual.set(y, (mutual.get(y) || 0) + 1);
+        }
+      }
+      return allUsers()
+        .filter((u) => u.id !== me.id && !mine.has(u.id))
+        .map((u) => ({ u, n: mutual.get(u.id) || 0 }))
+        .sort((a, b) => b.n - a.n
+          || (b.u.createdAt || '').localeCompare(a.u.createdAt || '')
+          || a.u.username.localeCompare(b.u.username))
+        .slice(0, lim)
+        .map(({ u, n }) => ({ ...profile(u), mutualCount: n }));
     },
 
     async acceptFriend(otherId) {

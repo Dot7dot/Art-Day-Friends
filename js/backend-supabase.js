@@ -181,6 +181,12 @@ export async function createSupabaseBackend(url, anonKey) {
       return check(await sb.rpc('send_friend_request', { target: targetId }));
     },
 
+    /** 推薦好友：{ ...profile, mutualCount }；資料庫還沒更新（沒有這個函式）時丟出 code 'PGRST202' */
+    async suggestFriends(limit = 8) {
+      const rows = check(await sb.rpc('suggest_friends', { max_count: limit }));
+      return (rows || []).map((r) => ({ ...mapProfile(r), mutualCount: r.mutual_count || 0 }));
+    },
+
     async acceptFriend(otherId) {
       check(await sb.from('friendships').update({ status: 'accepted' })
         .eq('requester', otherId).eq('addressee', me.id));
