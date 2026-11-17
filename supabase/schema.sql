@@ -185,6 +185,57 @@ revoke execute on function public.is_my_friend(uuid) from public, anon;
 grant execute on function public.is_my_friend(uuid) to authenticated;
 
 
+-- 推薦好友：先列出「共同好友」最多的人，不夠再用最近加入的人補滿。
+-- 排除自己、已是好友、以及任一方向還有待回覆邀請的人。
+-- 因為 RLS 只讓你看到自己的好友關係，這裡用 security definer 在資料庫內計算，
+-- 只回傳「共同好友的數量」，不會洩漏共同好友是誰（也就不洩漏別人的好友名單）。
+create or replace function public.suggest_friends(max_count int default 8)
+returns table (id uuid, username text, display_name text, mutual_count int)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  me uuid := auth.uid();
+  lim int := least(greatest(coalesce(max_count, 8), 1), 20);
+begin
+  if me is null then
+    raise exception 'not signed in';
+  end if;
+
+  return query
+  with my_friends as (
+    select case when f.requester = me then f.addressee else f.requester end as fid
+      from public.friendships f
+     where f.status = 'accepted' and me in (f.requester, f.addressee)
+  ),
+  mutual as (
+    select case when f.requester = mf.fid then f.addressee else f.requester end as cid,
+           count(*) as n
+      from public.friendships f
+      join my_friends mf on mf.fid in (f.requester, f.addressee)
+     where f.status = 'accepted'
+       and me not in (f.requester, f.addressee)
+     group by 1
+  )
+  select p.id, p.username, p.display_name, coalesce(m.n, 0)::int as mutual_count
+    from public.profiles p
+    left join mutual m on m.cid = p.id
+   where p.id <> me
+     and not exists (
+       select 1 from public.friendships r
+        where (r.requester = me and r.addressee = p.id)
+           or (r.requester = p.id and r.addressee = me))
+   order by coalesce(m.n, 0) desc, p.created_at desc, p.username
+   limit lim;
+end;
+$$;
+
+revoke execute on function public.suggest_friends(int) from public, anon;
+grant execute on function public.suggest_friends(int) to authenticated;
+
+
 -- ── 3. 今天的畫（只放當天，隔天刪除）───────────────────────────────
 create table if not exists public.drawings (
   id         uuid primary key,

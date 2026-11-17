@@ -731,7 +731,10 @@ async function paintFeed(body, c) {
       <h2>還沒有好友</h2>
       <p class="muted">加好友之後，就能看到彼此今天畫了什麼。</p>
       <a class="btn btn-primary" href="#/friends/list">${icon('userPlus', 18)}<span>加好友</span></a>
-    </div>`;
+    </div>
+    <div id="suggest-slot"></div>`;
+    body.onclick = onFeedSuggestClick;
+    await fillFeedSuggestions($('#suggest-slot', body), c);
     return;
   }
   const active = posts.filter((p) => p.drawings.length || p.note)
@@ -748,12 +751,15 @@ async function paintFeed(body, c) {
     ${idle.length ? `<div class="idle">
       <h3>今天還沒動筆</h3>
       <div class="idle-list">${idle.map((p) => `<span class="idle-person">${avatar(p.profile, 30)}<span>${esc(p.profile.displayName)}</span></span>`).join('')}</div>
-    </div>` : ''}`;
+    </div>` : ''}
+    <div id="suggest-slot"></div>`;
+  fillFeedSuggestions($('#suggest-slot', body), c);
 
   const images = new Map();
   for (const p of active) for (const d of p.drawings) images.set(d.id, { ...d, who: p.profile.displayName });
 
   body.onclick = (e) => {
+    if (onFeedSuggestClick(e)) return;
     const b = e.target.closest('[data-cloud-view]');
     if (!b) return;
     const img = $('img', b);
@@ -816,10 +822,102 @@ function postCard(p) {
   </article>`;
 }
 
-function personRow(p, actions) {
+// ── 推薦好友 ──
+const SUGGEST_MAX_LIST = 8;
+const SUGGEST_MAX_FEED = 4;
+const dismissKey = () => `artday.suggest.dismissed.${state.me?.id}`;
+
+function dismissedIds() {
+  try { return new Set(JSON.parse(localStorage.getItem(dismissKey())) || []); } catch { return new Set(); }
+}
+function dismissSuggestion(id) {
+  try {
+    const ids = [...dismissedIds(), id].slice(-200);
+    localStorage.setItem(dismissKey(), JSON.stringify(ids));
+  } catch { /* 無痕模式等情況存不了，就只在這一次畫面上隱藏 */ }
+}
+
+/** 取得推薦好友；雲端資料庫還沒更新（沒有 suggest_friends）或出錯時回傳 null，畫面就不顯示這一區 */
+async function loadSuggestions(limit) {
+  const skip = dismissedIds();
+  try {
+    const list = await state.backend.suggestFriends(Math.min(20, limit + skip.size));
+    return list.filter((p) => !skip.has(p.id)).slice(0, limit);
+  } catch (e) {
+    console.warn('suggestFriends unavailable', e);
+    return null;
+  }
+}
+
+const suggestReason = (p) => (p.mutualCount > 0 ? `${p.mutualCount} 位共同好友` : '新加入');
+
+function suggestRow(p) {
+  return personRow(p, `
+    <button class="btn btn-small btn-primary" data-add="${p.id}">${icon('userPlus', 16)}<span>加好友</span></button>
+    <button class="btn btn-small btn-ghost" data-skip="${p.id}" aria-label="略過 ${esc(p.displayName)}">略過</button>`,
+  `<span class="suggest-reason">${esc(suggestReason(p))}</span>`);
+}
+
+function suggestCard(p) {
+  return `<li class="suggest-card" data-suggest="${p.id}">
+    ${avatar(p, 48)}
+    <div class="suggest-who"><b>${esc(p.displayName)}</b><span class="muted small">@${esc(p.username)}</span></div>
+    <span class="suggest-reason">${esc(suggestReason(p))}</span>
+    <div class="suggest-actions">
+      <button class="btn btn-small btn-primary" data-suggest-add="${p.id}">${icon('userPlus', 16)}<span>加好友</span></button>
+      <button class="btn btn-small btn-ghost" data-skip="${p.id}" aria-label="略過 ${esc(p.displayName)}">略過</button>
+    </div>
+  </li>`;
+}
+
+/** 今日動態裡的精簡版：橫向捲動的小卡片 */
+function suggestStrip(list) {
+  return `<section class="section suggest-strip">
+    <div class="section-head"><h2>你可能認識</h2><a class="link-btn" href="#/friends/list">查看更多</a></div>
+    <ul class="suggest-scroll">${list.map(suggestCard).join('')}</ul>
+  </section>`;
+}
+
+async function fillFeedSuggestions(slot, c) {
+  const list = await loadSuggestions(SUGGEST_MAX_FEED);
+  if (!c.alive || !list?.length) return;
+  slot.innerHTML = suggestStrip(list);
+}
+
+/** 動態頁的推薦卡片：加好友／略過。有處理就回傳 true */
+function onFeedSuggestClick(e) {
+  const b = e.target.closest('button');
+  if (!b) return false;
+  const card = b.closest('.suggest-card');
+  if (!card) return false;
+  if (b.dataset.skip) {
+    dismissSuggestion(b.dataset.skip);
+    const strip = card.closest('.suggest-strip');
+    card.remove();
+    if (strip && !$('.suggest-card', strip)) strip.remove();
+    return true;
+  }
+  if (b.dataset.suggestAdd) {
+    setBusy(b, true);
+    state.backend.sendFriendRequest(b.dataset.suggestAdd).then((r) => {
+      const done = r === 'accepted' || r === 'already_friends';
+      $('.suggest-actions', card).innerHTML = `<span class="tag">${done ? '已成為好友' : '已邀請'}</span>`;
+      toast(done ? '你們成為好友了！重新整理就能看到對方今天的畫' : '邀請已送出，等對方接受');
+      badgeAt = Date.now();
+    }).catch((err) => {
+      console.warn(err);
+      setBusy(b, false);
+      toast(err.message || '發生錯誤', 'error');
+    });
+    return true;
+  }
+  return false;
+}
+
+function personRow(p, actions, extra = '') {
   return `<li class="person">
     ${avatar(p, 40)}
-    <div class="person-name"><b>${esc(p.displayName)}</b><span class="muted small">@${esc(p.username)}</span></div>
+    <div class="person-name"><b>${esc(p.displayName)}</b><span class="muted small">@${esc(p.username)}</span>${extra}</div>
     <div class="person-actions">${actions}</div>
   </li>`;
 }
@@ -857,7 +955,7 @@ async function paintFriendList(body, c) {
         <span class="input-adorn grow"><span>@</span><input name="q" placeholder="輸入對方的使用者 ID" autocomplete="off" autocapitalize="none" spellcheck="false" aria-label="使用者 ID"></span>
         <button class="btn btn-primary" type="submit">${icon('search', 18)}<span>搜尋</span></button>
       </form>
-      ${isDemo() ? `<p class="muted small demo-hint">示範好友：${['momo_draws', 'ashu_sketch', 'lin_doodle'].map((u) => `<button class="link-btn" data-try="${u}">@${u}</button>`).join('、')}</p>` : ''}
+      ${isDemo() ? `<p class="muted small demo-hint">示範好友：${['momo_draws', 'ashu_sketch', 'lin_doodle', 'nana_paint', 'kai_ink'].map((u) => `<button class="link-btn" data-try="${u}">@${u}</button>`).join('、')}</p>` : ''}
       <ul class="people" id="search-results"></ul>
     </section>
 
@@ -878,7 +976,18 @@ async function paintFriendList(body, c) {
       ${fs.friends.length
         ? `<ul class="people">${fs.friends.map((p) => personRow(p, `<button class="btn btn-small btn-ghost" data-remove="${p.id}" data-name="${esc(p.displayName)}">移除</button>`)).join('')}</ul>`
         : `<p class="muted empty-line">還沒有好友。搜尋對方的使用者 ID，或把邀請連結傳給朋友吧！</p>`}
+    </section>
+
+    <div id="suggest-slot"></div>`;
+
+  loadSuggestions(SUGGEST_MAX_LIST).then((list) => {
+    const slot = $('#suggest-slot', body);
+    if (!c.alive || !slot || !list?.length) return;
+    slot.innerHTML = `<section class="section" id="suggest-section">
+      <h2>你可能認識</h2>
+      <ul class="people">${list.map(suggestRow).join('')}</ul>
     </section>`;
+  });
 
   const form = $('#search-form', body);
   const input = $('input', form);
@@ -912,6 +1021,13 @@ async function paintFriendList(body, c) {
         return;
       }
       if (d.try) { input.value = d.try; search(d.try); return; }
+      if (d.skip) {
+        dismissSuggestion(d.skip);
+        const sec = b.closest('#suggest-section');
+        b.closest('.person').remove();
+        if (sec && !$('.person', sec)) sec.remove();
+        return;
+      }
       if (d.add) {
         setBusy(b, true);
         const r = await state.backend.sendFriendRequest(d.add);
