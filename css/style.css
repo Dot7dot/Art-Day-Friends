@@ -441,6 +441,18 @@ textarea.lined::placeholder { color: #b1a79e; }
   white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2);
 }
 .post-grid + .post-note { margin-top: 14px; }
+.post-loading { cursor: default; }
+.post-img .badge { pointer-events: none; }
+
+/* 首頁最上面「我自己」 */
+.me-tag {
+  display: inline-flex; align-items: center; height: 20px; padding: 0 8px; margin-left: 8px;
+  border-radius: var(--pill); background: var(--wash); color: var(--orange-ink);
+  font-size: 12px; font-weight: 800; vertical-align: 2px;
+}
+.mine-empty { display: flex; align-items: center; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; padding: 14px 16px; border-style: dashed; }
+.mine-empty-head { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1 1 220px; }
+.mine-empty-actions { display: flex; gap: 8px; flex: none; }
 
 .idle { margin-top: 28px; padding-top: 20px; border-top: var(--lw) dashed var(--line); }
 .idle h3 { color: var(--muted); margin-bottom: 12px; }
@@ -769,6 +781,37 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
   width: 46px; height: 46px; flex: none; display: grid; place-items: center;
   border-radius: 16px; background: var(--wash); color: var(--orange-ink);
 }
+
+/* ── 相機視窗（電腦用）────────────────────────────── */
+
+.modal-camera { max-width: 560px; }
+.camera { display: grid; gap: 16px; }
+.camera-stage {
+  position: relative; aspect-ratio: 4 / 3; overflow: hidden;
+  border: var(--lw) solid var(--line); border-radius: var(--r); background: var(--paper);
+}
+.camera-stage video, .camera-shot { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; background: var(--paper); }
+.camera-stage [hidden] { display: none; }
+.camera-stage video.mirror { transform: scaleX(-1); }
+.camera-msg {
+  position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 12px;
+  padding: 20px; text-align: center; color: var(--ink-2); line-height: 1.6;
+}
+.camera-msg-ico {
+  width: 64px; height: 64px; display: grid; place-items: center; border-radius: 22px;
+  border: var(--lw) solid var(--line); background: var(--wash); color: var(--orange-ink);
+}
+.camera-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 72px; }
+.camera-bar[hidden] { display: none; }
+.camera-bar.review { justify-content: center; }
+.camera-side { width: 44px; display: grid; place-items: center; }
+.shutter {
+  width: 72px; height: 72px; padding: 0; border-radius: 50%; display: grid; place-items: center; cursor: pointer;
+  border: 3px solid var(--orange); background: var(--bg); transition: transform .1s;
+}
+.shutter span { width: 54px; height: 54px; border-radius: 50%; background: var(--orange); display: block; }
+.shutter:active { transform: scale(.93); }
+.shutter:disabled { opacity: .4; cursor: default; transform: none; }
 
 /* ── 提示 ─────────────────────────────────────────── */
 

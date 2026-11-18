@@ -5,8 +5,39 @@ const CLOUD_MAX = 1280;   // 雲端副本的最長邊
 const THUMB_MAX = 360;    // 日曆縮圖
 const CLOUD_LIMIT = 900_000; // 雲端副本 data URL 的大小上限（字元）
 
-async function decode(blob) {
+/** 先用 <img> 讀出（已套用 EXIF 方向的）尺寸；失敗就回傳 null */
+function probeSize(blob) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    const done = (v) => { URL.revokeObjectURL(url); resolve(v); };
+    img.onload = () => done(img.naturalWidth && img.naturalHeight ? { w: img.naturalWidth, h: img.naturalHeight } : null);
+    img.onerror = () => done(null);
+    img.src = url;
+  });
+}
+
+/**
+ * 解碼成可以畫在 canvas 上的來源。
+ * max：預期用到的最長邊。相機照片常有 12–50 MP，整張解開要吃掉上百 MB 記憶體，
+ * 所以超過 max 時請瀏覽器「邊解碼邊縮小」（createImageBitmap 的 resize 選項），不行再退回完整解碼。
+ */
+async function decode(blob, max = Infinity) {
   if ('createImageBitmap' in window) {
+    if (Number.isFinite(max)) {
+      try {
+        const dim = await probeSize(blob);
+        if (dim && Math.max(dim.w, dim.h) > max * 1.5) {
+          const s = max / Math.max(dim.w, dim.h);
+          const w = Math.max(1, Math.round(dim.w * s));
+          const h = Math.max(1, Math.round(dim.h * s));
+          const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image', resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
+          // 保險：尺寸比例不符（有些瀏覽器的方向與縮放順序不同）就不用這個結果
+          if (Math.abs(bmp.width / bmp.height - dim.w / dim.h) < 0.02) return bmp;
+          bmp.close?.();
+        }
+      } catch { /* 改用完整解碼 */ }
+    }
     try { return await createImageBitmap(blob, { imageOrientation: 'from-image' }); } catch { /* 改用 <img> */ }
   }
   return new Promise((resolve, reject) => {
@@ -44,7 +75,7 @@ const release = (src) => { if (typeof src.close === 'function') src.close(); };
 /** 處理一張新圖：回傳本機版、縮圖與尺寸 */
 export async function processImage(blob) {
   if (blob.type && !blob.type.startsWith('image/')) throw new Error('只能上傳圖片檔');
-  const src = await decode(blob);
+  const src = await decode(blob, LOCAL_MAX);
   try {
     const big = drawScaled(src, LOCAL_MAX);
     const full = await canvasToBlob(big, 0.9);
@@ -93,7 +124,7 @@ const AVATAR_LIMIT = 30_000; // data URL 字元數上限（目標值，資料庫
 /** 大頭貼：置中裁成正方形、縮成 160×160、轉成 JPEG data URL（盡量小於 30 KB） */
 export async function makeAvatar(blob) {
   if (blob.type && !blob.type.startsWith('image/')) throw new Error('只能使用圖片檔');
-  const src = await decode(blob);
+  const src = await decode(blob, 2048);
   try {
     const { w, h } = sizeOf(src);
     const side = Math.min(w, h);
