@@ -10,6 +10,8 @@
 --    過期後好友就讀不到（RLS 擋住），並由排程／App 自動刪除。
 --  • 只有互相是好友（accepted）的人，才看得到對方今天的畫與文字。
 --  • 好友可以在今天的畫上留言；留言是很小的純文字，永久保留給畫的主人。
+--  • 推薦貼文（選擇加入）：profiles.share_public = true 的人，今天的畫與文字
+--    非好友也看得到（只能看，不能留言）。預設關閉，要使用者自己打開。
 -- ════════════════════════════════════════════════════════════════
 
 
@@ -26,6 +28,9 @@ alter table public.profiles add column if not exists avatar text;
 alter table public.profiles drop constraint if exists profiles_avatar_check;
 alter table public.profiles add constraint profiles_avatar_check
   check (avatar is null or (avatar ~ '^data:image/(jpeg|png|webp);base64,' and char_length(avatar) <= 60000));
+
+-- 推薦貼文：同意「非好友也能看到我今天的畫」。預設 false（要使用者自己開啟）
+alter table public.profiles add column if not exists share_public boolean not null default false;
 
 alter table public.profiles enable row level security;
 
@@ -44,7 +49,7 @@ create policy "profiles: update own" on public.profiles
 revoke all on public.profiles from anon;
 revoke update on public.profiles from authenticated;
 grant select, insert on public.profiles to authenticated;
-grant update (display_name, avatar) on public.profiles to authenticated;   -- 只能改暱稱與大頭貼，不能改 ID
+grant update (display_name, avatar, share_public) on public.profiles to authenticated;   -- 只能改暱稱、大頭貼與推薦設定，不能改 ID
 
 -- 註冊時自動建立個人檔案（從註冊表單帶來的 username / display_name）
 create or replace function public.handle_new_user()
@@ -190,6 +195,20 @@ $$;
 revoke execute on function public.is_my_friend(uuid) from public, anon;
 grant execute on function public.is_my_friend(uuid) to authenticated;
 
+-- 某人有沒有同意公開分享今天的畫（給 RLS 使用；security definer 才不會在 profiles 的規則裡繞圈）
+create or replace function public.is_public_profile(uid uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (select 1 from public.profiles p where p.id = uid and p.share_public);
+$$;
+
+revoke execute on function public.is_public_profile(uuid) from public, anon;
+grant execute on function public.is_public_profile(uuid) to authenticated;
+
 
 -- 推薦好友：先列出「共同好友」最多的人，不夠再用最近加入的人補滿。
 -- 排除自己、已是好友、以及任一方向還有待回覆邀請的人。
@@ -261,10 +280,14 @@ create index if not exists drawings_expires_idx on public.drawings (expires_at);
 
 alter table public.drawings enable row level security;
 
+-- 自己的永遠看得到；今天的畫：好友，或同意公開分享（推薦貼文）的人
 drop policy if exists "drawings: owner or friends today" on public.drawings;
 create policy "drawings: owner or friends today" on public.drawings
   for select to authenticated
-  using (user_id = (select auth.uid()) or (expires_at > now() and public.is_my_friend(user_id)));
+  using (
+    user_id = (select auth.uid())
+    or (expires_at > now() and (public.is_my_friend(user_id) or public.is_public_profile(user_id)))
+  );
 
 drop policy if exists "drawings: insert own" on public.drawings;
 create policy "drawings: insert own" on public.drawings
@@ -320,7 +343,10 @@ alter table public.day_notes enable row level security;
 drop policy if exists "day_notes: owner or friends today" on public.day_notes;
 create policy "day_notes: owner or friends today" on public.day_notes
   for select to authenticated
-  using (user_id = (select auth.uid()) or (expires_at > now() and public.is_my_friend(user_id)));
+  using (
+    user_id = (select auth.uid())
+    or (expires_at > now() and (public.is_my_friend(user_id) or public.is_public_profile(user_id)))
+  );
 
 drop policy if exists "day_notes: insert own" on public.day_notes;
 create policy "day_notes: insert own" on public.day_notes
@@ -356,6 +382,66 @@ create trigger day_notes_guard
   before insert or update on public.day_notes
   for each row execute function public.guard_note();
 
+
+-- 推薦貼文：同意公開分享、不是我、和我沒有任何好友關係（含待回覆）、而且今天還有畫的人。
+-- 共同好友多的在前，再依最近發佈時間。只回傳共同好友的「數量」，不洩漏是誰。
+-- （不會用到 drawings 的 RLS：security definer 在資料庫內算，圖片仍由前端用一般查詢讀取）
+drop function if exists public.recommended_posts(int);
+create function public.recommended_posts(max_count int default 6)
+returns table (user_id uuid, username text, display_name text, avatar text,
+               mutual_count int, drawing_count int, last_at timestamptz)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  me uuid := auth.uid();
+  lim int := least(greatest(coalesce(max_count, 6), 1), 20);
+begin
+  if me is null then
+    raise exception 'not signed in';
+  end if;
+
+  return query
+  with my_friends as (
+    select case when f.requester = me then f.addressee else f.requester end as fid
+      from public.friendships f
+     where f.status = 'accepted' and me in (f.requester, f.addressee)
+  ),
+  mutual as (
+    select case when f.requester = mf.fid then f.addressee else f.requester end as cid,
+           count(*) as n
+      from public.friendships f
+      join my_friends mf on mf.fid in (f.requester, f.addressee)
+     where f.status = 'accepted'
+       and me not in (f.requester, f.addressee)
+     group by 1
+  ),
+  live as (
+    select d.user_id as uid, count(*)::int as cnt, max(d.created_at) as last_at
+      from public.drawings d
+     where d.expires_at > now()
+     group by d.user_id
+  )
+  select p.id, p.username, p.display_name, p.avatar,
+         coalesce(m.n, 0)::int, l.cnt, l.last_at
+    from public.profiles p
+    join live l on l.uid = p.id
+    left join mutual m on m.cid = p.id
+   where p.share_public
+     and p.id <> me
+     and not exists (
+       select 1 from public.friendships r
+        where (r.requester = me and r.addressee = p.id)
+           or (r.requester = p.id and r.addressee = me))
+   order by coalesce(m.n, 0) desc, l.last_at desc, p.username
+   limit lim;
+end;
+$$;
+
+revoke execute on function public.recommended_posts(int) from public, anon;
+grant execute on function public.recommended_posts(int) to authenticated;
 
 -- ── 5. 畫的留言（永久保留，不跟著畫一起刪除）──────────────────────────
 --  • 好友可以在「還沒過期」的畫上留言；畫的主人能永遠看到所有留言。

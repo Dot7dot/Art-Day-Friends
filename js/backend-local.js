@@ -32,12 +32,12 @@ const DEMO_ARTISTS = [
   {
     id: 'demo-nana', username: 'nana_paint', displayName: '娜娜', themes: [2, 1],
     notes: ['今天試了水彩暈染。', '用咖啡漬當底色，意外好看。', '小小的一張，慢慢畫。'],
-    posts: (day) => Number(day.slice(-2)) % 3 !== 0,
+    posts: () => true, // 每天都畫、也不會自動成為好友：用來示範「推薦貼文」
   },
   {
     id: 'demo-kai', username: 'kai_ink', displayName: '阿凱', themes: [0, 1],
     notes: ['黑色墨水加一點橘色。', '午休十分鐘塗鴉。'],
-    posts: (day) => Number(day.slice(-2)) % 2 === 1,
+    posts: () => true,
   },
 ];
 
@@ -98,7 +98,8 @@ export async function createLocalBackend() {
 
   let me = null;
   const allUsers = () => read(K_USERS, []);
-  const profile = (u) => u && { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar || null, demo: !!u.demo };
+  // 推薦設定：示範畫家預設都同意公開（demo）；一般使用者預設不公開，要自己開
+  const profile = (u) => u && { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar || null, demo: !!u.demo, sharePublic: u.demo ? u.sharePublic !== false : !!u.sharePublic };
   const byId = (id) => profile(allUsers().find((u) => u.id === id));
   const friendships = () => read(K_FRIENDS, []);
   const nowIso = () => new Date().toISOString();
@@ -180,11 +181,11 @@ export async function createLocalBackend() {
       return !allUsers().some((u) => u.username === username.toLowerCase());
     },
 
-    async signUp({ username, displayName, password }) {
+    async signUp({ username, displayName, password, sharePublic = false }) {
       username = username.toLowerCase();
       if (!(await api.usernameAvailable(username))) throw new Error('這個使用者 ID 已經有人用了');
       const salt = randomHex(8);
-      const user = { id: `u-${randomHex(8)}`, username, displayName, salt, hash: await sha256(`${salt}:${password}`), createdAt: nowIso() };
+      const user = { id: `u-${randomHex(8)}`, username, displayName, sharePublic: !!sharePublic, salt, hash: await sha256(`${salt}:${password}`), createdAt: nowIso() };
       write(K_USERS, [...allUsers(), user]);
       // 示範：桃桃主動送來好友邀請
       write(K_FRIENDS, [...friendships(), { requester: 'demo-momo', addressee: user.id, status: 'pending', createdAt: nowIso() }]);
@@ -206,12 +207,13 @@ export async function createLocalBackend() {
       me = null;
     },
 
-    /** displayName、avatar（data URL，或 null 代表移除）都是選填，沒給的就不動 */
-    async updateProfile({ displayName, avatar } = {}) {
+    /** displayName、avatar（data URL，或 null 代表移除）、sharePublic 都是選填，沒給的就不動 */
+    async updateProfile({ displayName, avatar, sharePublic } = {}) {
       write(K_USERS, allUsers().map((u) => {
         if (u.id !== me.id) return u;
         const next = { ...u };
         if (displayName !== undefined) next.displayName = displayName;
+        if (sharePublic !== undefined) next.sharePublic = !!sharePublic;
         if (avatar !== undefined) {
           if (avatar === null) delete next.avatar;
           else if (/^data:image\/(jpeg|png|webp);base64,/.test(avatar) && avatar.length <= 60000) next.avatar = avatar;
@@ -338,6 +340,51 @@ export async function createLocalBackend() {
           || a.u.username.localeCompare(b.u.username))
         .slice(0, lim)
         .map(({ u, n }) => ({ ...profile(u), mutualCount: n }));
+    },
+
+    /**
+     * 推薦貼文（規則同雲端版 recommended_posts）：同意公開、不是我、沒有任何好友關係、今天有畫。
+     * 共同好友多的在前，再依最近發佈時間。回傳和 fetchFriendsToday 一樣的貼文格式，多一個 mutualCount。
+     */
+    async recommendedPosts(limit = 6) {
+      const lim = Math.min(Math.max(Number(limit) || 6, 1), 20);
+      await ensureDemoPosts(dayKey());
+      const all = friendships();
+      const other = (f, id) => (f.requester === id ? f.addressee : f.requester);
+      const related = new Set(all.filter((f) => f.requester === me.id || f.addressee === me.id).map((f) => other(f, me.id)));
+      const myFriends = new Set(all.filter((f) => f.status === 'accepted' && (f.requester === me.id || f.addressee === me.id)).map((f) => other(f, me.id)));
+      const mutual = new Map();
+      for (const f of all) {
+        if (f.status !== 'accepted') continue;
+        for (const [x, y] of [[f.requester, f.addressee], [f.addressee, f.requester]]) {
+          if (myFriends.has(x) && y !== me.id) mutual.set(y, (mutual.get(y) || 0) + 1);
+        }
+      }
+      const now = nowIso();
+      const out = [];
+      for (const u of allUsers()) {
+        const p = profile(u);
+        if (u.id === me.id || related.has(u.id) || !p.sharePublic) continue;
+        const [ds, ns] = await run(cloud, ['drawings', 'notes'], 'readonly', ({ drawings, notes }) => Promise.all([
+          promisify(drawings.index('byUser').getAll(u.id)),
+          promisify(notes.getAll(IDBKeyRange.bound([u.id, ''], [u.id, '￿']))),
+        ]));
+        const live = ds.filter((d) => d.expiresAt > now).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+        if (!live.length) continue;
+        const note = ns.filter((x) => x.expiresAt > now).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+        const times = [...live.map((d) => d.createdAt), note?.updatedAt].filter(Boolean).sort();
+        out.push({
+          profile: p,
+          mutualCount: mutual.get(u.id) || 0,
+          drawings: live.map(({ id, width, height, createdAt, image }) => ({ id, width, height, createdAt, image })),
+          note: note?.note || '',
+          lastAt: times[times.length - 1] || null,
+        });
+      }
+      return out
+        .sort((a, b) => b.mutualCount - a.mutualCount || (b.lastAt || '').localeCompare(a.lastAt || '')
+          || a.profile.username.localeCompare(b.profile.username))
+        .slice(0, lim);
     },
 
     async acceptFriend(otherId) {

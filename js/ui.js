@@ -25,8 +25,8 @@ export function debounce(fn, ms) {
 
 // ── 提示 ─────────────────────────────────────────
 
-/** action = { label, onClick }：提示裡多一個可以點的連結（顯示久一點） */
-export function toast(message, kind = '', { action } = {}) {
+/** action = { label, onClick }：提示裡多一個可以點的連結（顯示久一點）；duration 可自訂毫秒數 */
+export function toast(message, kind = '', { action, duration } = {}) {
   const root = document.getElementById('toast-root');
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
@@ -48,7 +48,7 @@ export function toast(message, kind = '', { action } = {}) {
   }
   root.append(el);
   requestAnimationFrame(() => el.classList.add('show'));
-  setTimeout(hide, action ? 5200 : 2600);
+  setTimeout(hide, duration || (action ? 5200 : 2600));
 }
 
 // ── 對話框 ───────────────────────────────────────
