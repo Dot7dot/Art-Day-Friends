@@ -98,7 +98,7 @@ export async function createLocalBackend() {
 
   let me = null;
   const allUsers = () => read(K_USERS, []);
-  const profile = (u) => u && { id: u.id, username: u.username, displayName: u.displayName, demo: !!u.demo };
+  const profile = (u) => u && { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar || null, demo: !!u.demo };
   const byId = (id) => profile(allUsers().find((u) => u.id === id));
   const friendships = () => read(K_FRIENDS, []);
   const nowIso = () => new Date().toISOString();
@@ -206,8 +206,19 @@ export async function createLocalBackend() {
       me = null;
     },
 
-    async updateProfile({ displayName }) {
-      write(K_USERS, allUsers().map((u) => (u.id === me.id ? { ...u, displayName } : u)));
+    /** displayName、avatar（data URL，或 null 代表移除）都是選填，沒給的就不動 */
+    async updateProfile({ displayName, avatar } = {}) {
+      write(K_USERS, allUsers().map((u) => {
+        if (u.id !== me.id) return u;
+        const next = { ...u };
+        if (displayName !== undefined) next.displayName = displayName;
+        if (avatar !== undefined) {
+          if (avatar === null) delete next.avatar;
+          else if (/^data:image\/(jpeg|png|webp);base64,/.test(avatar) && avatar.length <= 60000) next.avatar = avatar;
+          else throw new Error('大頭貼格式不正確');
+        }
+        return next;
+      }));
       me = byId(me.id);
       return me;
     },

@@ -47,7 +47,15 @@ const RECOVERY_UNSUPPORTED = Object.assign(new Error(MSG.unsupported), { code: '
 const COMMENT_COLS = 'id, drawing_id, day, body, created_at, author';
 const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
 
-const mapProfile = (p) => p && { id: p.id, username: p.username, displayName: p.display_name };
+const mapProfile = (p) => p && { id: p.id, username: p.username, displayName: p.display_name, avatar: p.avatar || null };
+
+// 資料庫還沒執行最新 schema.sql（profiles 沒有 avatar 欄位）：42703 = 欄位不存在，PGRST204 = PostgREST 找不到欄位
+const isMissingAvatarCol = (e) => !!e && /avatar/i.test(e.message || '')
+  && (/^(42703|PGRST204)$/.test(e.code || '') || /column|schema cache/i.test(e.message || ''));
+const AVATAR_UNSUPPORTED = Object.assign(
+  new Error('大頭貼功能還沒開啟：請網站管理員到 Supabase SQL Editor 重新執行最新的 supabase/schema.sql'),
+  { code: 'AVATAR_UNSUPPORTED' },
+);
 
 const mapComment = (r, author) => ({
   id: r.id, drawingId: r.drawing_id, day: r.day, body: r.body, createdAt: r.created_at,
@@ -64,15 +72,27 @@ export async function createSupabaseBackend(url, anonKey) {
   let authBusy = false; // 自己正在登入／註冊時，不重複處理登入事件
   const imageCache = new Map();
 
+  // 查個人檔案時一併取 avatar；資料庫還沒更新時退回不含 avatar 的查詢，並記住（本次使用期間）
+  let avatarOk = true;
+  const profileCols = () => (avatarOk ? 'id, username, display_name, avatar' : 'id, username, display_name');
+  async function profileQuery(make) {
+    let res = await make(profileCols());
+    if (res.error && avatarOk && isMissingAvatarCol(res.error)) {
+      avatarOk = false;
+      res = await make(profileCols());
+    }
+    return check(res);
+  }
+
   async function loadProfile(user) {
-    let p = check(await sb.from('profiles').select('id, username, display_name').eq('id', user.id).maybeSingle());
+    let p = await profileQuery((cols) => sb.from('profiles').select(cols).eq('id', user.id).maybeSingle());
     if (!p) {
       // 萬一資料庫觸發器沒建立 profile，這裡補建
       const meta = user.user_metadata || {};
       const username = /^[a-z0-9_]{3,20}$/.test(meta.username || '') ? meta.username : `artist_${user.id.replace(/-/g, '').slice(0, 8)}`;
-      p = check(await sb.from('profiles')
+      p = await profileQuery((cols) => sb.from('profiles')
         .insert({ id: user.id, username, display_name: (meta.display_name || username).slice(0, 30) })
-        .select('id, username, display_name').single());
+        .select(cols).single());
     }
     return mapProfile(p);
   }
@@ -143,9 +163,21 @@ export async function createSupabaseBackend(url, anonKey) {
       await sb.auth.signOut();
     },
 
-    async updateProfile({ displayName }) {
-      const p = check(await sb.from('profiles').update({ display_name: displayName }).eq('id', me.id)
-        .select('id, username, display_name').single());
+    /** displayName、avatar（data URL，或 null 代表移除）都是選填，沒給的就不動 */
+    async updateProfile({ displayName, avatar } = {}) {
+      const patch = {};
+      if (displayName !== undefined) patch.display_name = displayName;
+      if (avatar !== undefined) {
+        if (!avatarOk) throw AVATAR_UNSUPPORTED;
+        patch.avatar = avatar;
+      }
+      let p;
+      try {
+        p = await profileQuery((cols) => sb.from('profiles').update(patch).eq('id', me.id).select(cols).single());
+      } catch (e) {
+        if (avatar !== undefined && isMissingAvatarCol(e.cause)) { avatarOk = false; throw AVATAR_UNSUPPORTED; }
+        throw e;
+      }
       me = mapProfile(p);
       return me;
     },
@@ -200,7 +232,7 @@ export async function createSupabaseBackend(url, anonKey) {
     },
 
     async findUser(username) {
-      const p = check(await sb.from('profiles').select('id, username, display_name')
+      const p = await profileQuery((cols) => sb.from('profiles').select(cols)
         .eq('username', username.toLowerCase()).neq('id', me.id).maybeSingle());
       return mapProfile(p);
     },
@@ -208,7 +240,7 @@ export async function createSupabaseBackend(url, anonKey) {
     async searchUsers(q) {
       const safe = q.toLowerCase().replace(/[^a-z0-9_]/g, '').replace(/_/g, '\\_');
       if (!safe) return [];
-      const rows = check(await sb.from('profiles').select('id, username, display_name')
+      const rows = await profileQuery((cols) => sb.from('profiles').select(cols)
         .ilike('username', `%${safe}%`).neq('id', me.id).order('username').limit(20));
       return rows.map(mapProfile);
     },
@@ -217,7 +249,7 @@ export async function createSupabaseBackend(url, anonKey) {
       const rows = check(await sb.from('friendships').select('requester, addressee, status'));
       const otherIds = [...new Set(rows.map((r) => (r.requester === me.id ? r.addressee : r.requester)))];
       const profiles = otherIds.length
-        ? check(await sb.from('profiles').select('id, username, display_name').in('id', otherIds))
+        ? await profileQuery((cols) => sb.from('profiles').select(cols).in('id', otherIds))
         : [];
       const byId = new Map(profiles.map((p) => [p.id, mapProfile(p)]));
       const out = { friends: [], incoming: [], outgoing: [] };
@@ -277,7 +309,7 @@ export async function createSupabaseBackend(url, anonKey) {
       const authorIds = [...new Set(rows.map((r) => r.author))];
       const byId = new Map();
       for (const part of chunk(authorIds, 80)) {
-        for (const p of check(await sb.from('profiles').select('id, username, display_name').in('id', part))) byId.set(p.id, mapProfile(p));
+        for (const p of await profileQuery((cols) => sb.from('profiles').select(cols).in('id', part))) byId.set(p.id, mapProfile(p));
       }
       return rows.map((r) => mapComment(r, byId.get(r.author)));
     },

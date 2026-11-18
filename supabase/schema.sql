@@ -21,6 +21,12 @@ create table if not exists public.profiles (
   created_at   timestamptz not null default now()
 );
 
+-- 大頭貼：160×160 的 JPEG data URL（約 10–20 KB），空值 = 顯示暱稱的第一個字
+alter table public.profiles add column if not exists avatar text;
+alter table public.profiles drop constraint if exists profiles_avatar_check;
+alter table public.profiles add constraint profiles_avatar_check
+  check (avatar is null or (avatar ~ '^data:image/(jpeg|png|webp);base64,' and char_length(avatar) <= 60000));
+
 alter table public.profiles enable row level security;
 
 drop policy if exists "profiles: signed-in users can read" on public.profiles;
@@ -38,7 +44,7 @@ create policy "profiles: update own" on public.profiles
 revoke all on public.profiles from anon;
 revoke update on public.profiles from authenticated;
 grant select, insert on public.profiles to authenticated;
-grant update (display_name) on public.profiles to authenticated;   -- 只能改暱稱，不能改 ID
+grant update (display_name, avatar) on public.profiles to authenticated;   -- 只能改暱稱與大頭貼，不能改 ID
 
 -- 註冊時自動建立個人檔案（從註冊表單帶來的 username / display_name）
 create or replace function public.handle_new_user()
@@ -189,8 +195,10 @@ grant execute on function public.is_my_friend(uuid) to authenticated;
 -- 排除自己、已是好友、以及任一方向還有待回覆邀請的人。
 -- 因為 RLS 只讓你看到自己的好友關係，這裡用 security definer 在資料庫內計算，
 -- 只回傳「共同好友的數量」，不會洩漏共同好友是誰（也就不洩漏別人的好友名單）。
-create or replace function public.suggest_friends(max_count int default 8)
-returns table (id uuid, username text, display_name text, mutual_count int)
+-- （回傳欄位多了 avatar；create or replace 不能改回傳型態，所以先 drop，下面再重新授權）
+drop function if exists public.suggest_friends(int);
+create function public.suggest_friends(max_count int default 8)
+returns table (id uuid, username text, display_name text, avatar text, mutual_count int)
 language plpgsql
 stable
 security definer
@@ -219,7 +227,7 @@ begin
        and me not in (f.requester, f.addressee)
      group by 1
   )
-  select p.id, p.username, p.display_name, coalesce(m.n, 0)::int as mutual_count
+  select p.id, p.username, p.display_name, p.avatar, coalesce(m.n, 0)::int as mutual_count
     from public.profiles p
     left join mutual m on m.cid = p.id
    where p.id <> me

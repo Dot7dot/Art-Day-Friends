@@ -472,6 +472,8 @@ textarea.lined::placeholder { color: #b1a79e; }
   background: var(--tint); border: var(--lw) solid var(--line);
   font-weight: 900; font-size: calc(var(--size) * .42); color: var(--ink); line-height: 1;
 }
+.avatar.has-img { overflow: hidden; background: var(--bg); }
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 .invite-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; background: var(--paper); }
 .my-id { font-size: 22px; font-weight: 900; overflow-wrap: anywhere; }
@@ -641,6 +643,14 @@ button.cal-cell:hover { transform: translateY(-2px); border-color: var(--line); 
 
 .profile-card { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
 .profile-main { flex: 1; min-width: 140px; }
+.profile-actions { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 8px; padding-top: 14px; border-top: var(--lw) solid var(--line-soft); }
+.avatar-edit { position: relative; padding: 0; border: 0; background: none; cursor: pointer; border-radius: 50%; flex: none; line-height: 0; }
+.avatar-edit:hover .avatar { border-color: var(--orange); }
+.avatar-edit-badge {
+  position: absolute; right: -2px; bottom: -2px; width: 26px; height: 26px; border-radius: 50%;
+  display: grid; place-items: center; background: var(--bg); color: var(--orange-ink);
+  border: var(--lw) solid var(--line);
+}
 .profile-main h1 { font-size: 24px; overflow-wrap: anywhere; }
 
 .link-card { display: flex; align-items: center; gap: 12px; padding: 12px 12px 12px 18px; }
@@ -725,6 +735,61 @@ button.cal-cell:hover { transform: translateY(-2px); border-color: var(--line); 
 .size-btn i { width: var(--d); height: var(--d); border-radius: 50%; background: currentColor; display: block; }
 .modal-sketch .modal-foot { margin-top: 16px; }
 
+/* ── 首頁的液態玻璃「＋」 ──────────────────────────
+   backdrop-filter 只放在按鈕本身：放在祖先元素上會讓 position: fixed 的子元素失效 */
+
+.view-sub { margin: 0 0 16px; }
+.view.has-fab { padding-bottom: calc(var(--nav-h) + var(--safe-b) + 96px); }
+
+.fab {
+  position: fixed; z-index: 25;
+  right: 16px; bottom: calc(var(--nav-h) + var(--safe-b) + 16px);
+  width: 60px; height: 60px; padding: 0; border-radius: 50%;
+  display: grid; place-items: center; cursor: pointer; color: var(--orange-ink);
+  background:
+    radial-gradient(120% 90% at 30% 8%, rgba(255, 255, 255, .85), rgba(255, 255, 255, 0) 55%),
+    linear-gradient(160deg, rgba(255, 255, 255, .55), rgba(255, 233, 212, .34));
+  -webkit-backdrop-filter: blur(14px) saturate(190%);
+  backdrop-filter: blur(14px) saturate(190%);
+  border: 1px solid rgba(242, 153, 74, .38);
+  box-shadow:
+    inset 0 1.5px 1px rgba(255, 255, 255, .95),
+    inset 0 -3px 6px rgba(242, 153, 74, .20),
+    0 10px 26px rgba(180, 88, 28, .20),
+    0 2px 5px rgba(42, 38, 34, .10);
+  transition: transform .15s ease, box-shadow .15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+.fab .ico { stroke-width: 2.4; filter: drop-shadow(0 1px 0 rgba(255, 255, 255, .8)); }
+@media (hover: hover) {
+  .fab:hover { transform: translateY(-2px) scale(1.05); box-shadow: inset 0 1.5px 1px rgba(255, 255, 255, .95), inset 0 -3px 6px rgba(242, 153, 74, .24), 0 14px 32px rgba(180, 88, 28, .26), 0 2px 6px rgba(42, 38, 34, .10); }
+}
+.fab:active { transform: scale(.93); box-shadow: inset 0 1.5px 1px rgba(255, 255, 255, .9), inset 0 -2px 4px rgba(242, 153, 74, .2), 0 4px 12px rgba(180, 88, 28, .18); }
+.fab:focus-visible { outline: 3px solid rgba(242, 153, 74, .55); outline-offset: 3px; }
+@media (min-width: 760px) {
+  /* 導覽在頂部列：按鈕放在內容區的右下角 */
+  .fab { bottom: 28px; right: max(16px, calc((100vw - 760px) / 2 + 24px)); }
+  .view.has-fab { padding-bottom: 112px; }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .fab { background: rgba(255, 250, 245, .94); }
+}
+
+.add-choices { display: grid; gap: 10px; }
+.add-choice {
+  display: flex; align-items: center; gap: 14px; width: 100%; padding: 14px 16px; text-align: left;
+  border: var(--lw) solid var(--line); border-radius: var(--r); background: var(--bg); color: var(--ink);
+  font: inherit; cursor: pointer; transition: background .15s, transform .1s;
+}
+.add-choice:hover { background: var(--wash); }
+.add-choice:active { transform: scale(.98); }
+.add-choice > span:last-child { display: grid; gap: 2px; }
+.add-choice b { font-size: 16px; }
+.add-choice-ico {
+  width: 46px; height: 46px; flex: none; display: grid; place-items: center;
+  border-radius: 16px; background: var(--wash); color: var(--orange-ink);
+}
+
 /* ── 提示 ─────────────────────────────────────────── */
 
 #toast-root {
@@ -739,6 +804,11 @@ button.cal-cell:hover { transform: translateY(-2px); border-color: var(--line); 
   opacity: 0; transform: translateY(8px); transition: opacity .2s, transform .2s;
 }
 .toast.show { opacity: 1; transform: none; }
+.toast { display: flex; align-items: center; justify-content: center; gap: 14px; }
+.toast-action {
+  pointer-events: auto; flex: none; padding: 2px 4px; margin: -2px -6px -2px 0; border: 0; background: none; cursor: pointer;
+  color: #ffd2a8; font: inherit; font-weight: 900; text-decoration: underline; text-underline-offset: 3px;
+}
 .toast.error { background: var(--danger); }
 
 @media (prefers-reduced-motion: reduce) {

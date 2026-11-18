@@ -86,3 +86,30 @@ export function dataURLToBlob(url) {
   }
   return new Blob([decodeURIComponent(body)], { type: mime });
 }
+
+const AVATAR_SIZE = 160;
+const AVATAR_LIMIT = 30_000; // data URL 字元數上限（目標值，資料庫上限是 60000）
+
+/** 大頭貼：置中裁成正方形、縮成 160×160、轉成 JPEG data URL（盡量小於 30 KB） */
+export async function makeAvatar(blob) {
+  if (blob.type && !blob.type.startsWith('image/')) throw new Error('只能使用圖片檔');
+  const src = await decode(blob);
+  try {
+    const { w, h } = sizeOf(src);
+    const side = Math.min(w, h);
+    const c = document.createElement('canvas');
+    c.width = c.height = AVATAR_SIZE;
+    const g = c.getContext('2d');
+    g.fillStyle = '#ffffff';
+    g.fillRect(0, 0, AVATAR_SIZE, AVATAR_SIZE);
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(src, (w - side) / 2, (h - side) / 2, side, side, 0, 0, AVATAR_SIZE, AVATAR_SIZE);
+    let url = '';
+    for (let q = 0.8; q >= 0.4; q -= 0.1) {
+      url = c.toDataURL('image/jpeg', q);
+      if (url.length <= AVATAR_LIMIT) break;
+    }
+    return url;
+  } finally { release(src); }
+}

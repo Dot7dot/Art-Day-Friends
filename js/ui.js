@@ -25,18 +25,30 @@ export function debounce(fn, ms) {
 
 // ── 提示 ─────────────────────────────────────────
 
-export function toast(message, kind = '') {
+/** action = { label, onClick }：提示裡多一個可以點的連結（顯示久一點） */
+export function toast(message, kind = '', { action } = {}) {
   const root = document.getElementById('toast-root');
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
   el.setAttribute('role', 'status');
-  el.textContent = message;
-  root.append(el);
-  requestAnimationFrame(() => el.classList.add('show'));
-  setTimeout(() => {
+  const text = document.createElement('span');
+  text.textContent = message;
+  el.append(text);
+  const hide = () => {
     el.classList.remove('show');
     setTimeout(() => el.remove(), 300);
-  }, 2600);
+  };
+  if (action) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'toast-action';
+    b.textContent = action.label;
+    b.addEventListener('click', () => { hide(); action.onClick?.(); });
+    el.append(b);
+  }
+  root.append(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(hide, action ? 5200 : 2600);
 }
 
 // ── 對話框 ───────────────────────────────────────
@@ -135,6 +147,10 @@ export function avatar(profile, size = 40) {
   const name = profile?.displayName || profile?.username || '?';
   const initial = [...name.trim()][0] || '?';
   const tint = AVATAR_TINTS[hash(profile?.username || name) % AVATAR_TINTS.length];
+  const photo = typeof profile?.avatar === 'string' && /^data:image\/(jpeg|png|webp);base64,/.test(profile.avatar) ? profile.avatar : '';
+  if (photo) {
+    return `<span class="avatar has-img" style="--size:${size}px;--tint:${tint}" aria-hidden="true"><img src="${esc(photo)}" alt="" decoding="async"></span>`;
+  }
   return `<span class="avatar" style="--size:${size}px;--tint:${tint}" aria-hidden="true">${esc(initial.toUpperCase())}</span>`;
 }
 

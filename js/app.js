@@ -3,7 +3,7 @@
 
 import { SUPABASE_URL, SUPABASE_ANON_KEY, MAX_CLOUD_DRAWINGS_PER_DAY as CLOUD_MAX } from './config.js';
 import * as archive from './archive.js';
-import { processImage, cloudCopy, makeThumb, dataURLToBlob } from './imaging.js';
+import { processImage, cloudCopy, makeThumb, dataURLToBlob, makeAvatar } from './imaging.js';
 import { icon } from './icons.js';
 import { dayKey, addDays, endOfDay, dayParts, formatDayLong, timeLeftToday, formatTime } from './dates.js';
 import { esc, toast, openModal, confirmDialog, lightbox, avatar, uuid, debounce, copyText, downloadBlob, setBusy } from './ui.js';
@@ -99,7 +99,7 @@ function checkDayChange() {
   if (t === state.today) return;
   state.today = t;
   if (!state.me) return;
-  const name = parseRoute().name;
+  const name = parseRoute().name || 'friends';
   if (name === 'today' || name === 'friends' || name === 'calendar') render();
   else dailyMaintenance();
 }
@@ -123,7 +123,8 @@ async function dailyMaintenance() {
 //  路由
 // ════════════════════════════════════════════════════════════════
 
-const VIEWS = { today: viewToday, friends: viewFriends, calendar: viewCalendar, me: viewMe };
+const VIEWS = { friends: viewFriends, today: viewToday, calendar: viewCalendar, me: viewMe };
+const HOME = 'friends'; // 首頁 = 好友動態
 
 function parseRoute() {
   const [name = '', arg = ''] = location.hash.replace(/^#\/?/, '').split('/');
@@ -143,7 +144,8 @@ async function render() {
   const c = newCtx();
   if (!state.me) { renderAuth(c); return; }
 
-  const name = VIEWS[route.name] ? route.name : 'today';
+  const name = VIEWS[route.name] ? route.name : HOME;
+  if (!VIEWS[route.name]) history.replaceState(null, '', `${location.pathname}${location.search}#/${HOME}`);
   const routeKey = `${name}/${route.arg}`;
   if (routeKey !== lastRoute) window.scrollTo(0, 0);
   lastRoute = routeKey;
@@ -194,10 +196,10 @@ function renderShell(active) {
   app.innerHTML = `
     <header class="topbar">
       <div class="topbar-inner">
-        <a class="brand" href="#/today">${brandMark()}<span class="brand-name">Art Day</span><span class="brand-sub">藝術小日曆</span></a>
+        <a class="brand" href="#/friends">${brandMark()}<span class="brand-name">Art Day</span><span class="brand-sub">藝術小日曆</span></a>
         <nav class="nav" aria-label="主選單">
-          ${navItem('today', '今天', 'sun', active)}
           ${navItem('friends', '好友', 'users', active)}
+          ${navItem('today', '今天', 'sun', active)}
           ${navItem('calendar', '日曆', 'calendar', active)}
           ${navItem('me', '我的', 'user', active)}
         </nav>
@@ -539,6 +541,50 @@ async function pushDrawing(rec) {
   }
 }
 
+/**
+ * 把圖片加進「今天」：存本機 → 同步到雲端（遵守每日雲端上限）→ 提示。
+ * 「今天」頁與首頁的「＋」按鈕共用這一份。多次呼叫會排隊，不會同時計算雲端張數。
+ *   onPending(n)  處理中的張數變化（開始時 +n，每張處理完 -1）
+ *   onChange()    本機資料有變動，畫面可以重畫
+ *   alive()       呼叫的畫面還在不在（不在就不顯示成功提示）
+ *   link          成功提示附上「查看」連結，點了到「今天」
+ */
+let addChain = Promise.resolve();
+function addAndShareToday(blobs, source, opts = {}) {
+  const run = () => addAndShareNow(blobs, source, opts);
+  const p = addChain.then(run, run);
+  addChain = p.catch(() => {});
+  return p;
+}
+
+async function addAndShareNow(blobs, source, { onPending, onChange, alive = () => true, link = false } = {}) {
+  onPending?.(blobs.length);
+  await onChange?.();
+  let failed = 0;
+  let added = 0;
+  for (const b of blobs) {
+    let rec = null;
+    try {
+      rec = await addDrawing(b, source);
+      added++;
+    } catch (e) {
+      toast(e.message || '這張圖片無法加入', 'error');
+    }
+    onPending?.(-1);
+    await onChange?.();
+    if (rec?.cloud === 'pending') {
+      try { await pushDrawing(rec); } catch (e) { failed++; console.warn(e); }
+      await onChange?.();
+    } else if (rec?.cloud === 'local') {
+      toast(`今天雲端已滿 ${CLOUD_MAX} 張，這張先存在本機`);
+    }
+  }
+  const action = link ? { action: { label: '查看', onClick: () => { location.hash = '#/today'; } } } : {};
+  if (failed) toast(link ? '有圖片還沒同步到雲端，可到「今天」點「重試」' : '有圖片還沒同步到雲端，稍後可點「重試」', 'error', action);
+  else if (added && alive()) toast(source === 'sketch' ? '放進今天了！' : '已加入今天', '', action);
+  return { added, failed };
+}
+
 async function removeDrawing(rec) {
   if (rec.day === dayKey() && rec.cloud === 'synced') {
     await state.backend.deleteDrawing(rec.id); // 先刪雲端（留言也會一起刪），失敗就整個取消
@@ -730,29 +776,11 @@ async function viewToday(el, c) {
          <button class="tile add-tile" data-sketch>${icon('pen', 26)}<span>隨手畫</span></button>`;
   }
 
-  async function addAndShare(blobs, source) {
-    processing += blobs.length;
-    await paintGrid();
-    let failed = 0;
-    for (const b of blobs) {
-      let rec = null;
-      try {
-        rec = await addDrawing(b, source);
-      } catch (e) {
-        toast(e.message || '這張圖片無法加入', 'error');
-      }
-      processing--;
-      await paintGrid();
-      if (rec?.cloud === 'pending') {
-        try { await pushDrawing(rec); } catch (e) { failed++; console.warn(e); }
-        await paintGrid();
-      } else if (rec?.cloud === 'local') {
-        toast(`今天雲端已滿 ${CLOUD_MAX} 張，這張先存在本機`);
-      }
-    }
-    if (failed) toast('有圖片還沒同步到雲端，稍後可點「重試」', 'error');
-    else if (blobs.length && c.alive) toast(source === 'sketch' ? '放進今天了！' : '已加入今天');
-  }
+  const addAndShare = (blobs, source) => addAndShareToday(blobs, source, {
+    onPending: (n) => { processing += n; },
+    onChange: () => (c.alive ? paintGrid() : null),
+    alive: () => c.alive,
+  });
 
   grid.addEventListener('click', async (e) => {
     const t = e.target.closest('button');
@@ -851,13 +879,7 @@ async function viewToday(el, c) {
 async function viewFriends(el, c, sub) {
   const tab = sub === 'list' ? 'list' : 'feed';
   el.innerHTML = `
-    <div class="page-head">
-      <div>
-        <h1>好友</h1>
-        <p class="muted">只看得到好友「今天」的畫，過了今天就消失。</p>
-      </div>
-      ${tab === 'feed' ? `<button class="icon-btn" data-refresh aria-label="重新整理">${icon('refresh')}</button>` : ''}
-    </div>
+    <p class="muted view-sub">只看得到好友「今天」的畫，過了今天就消失。</p>
     <div class="segmented seg-wide" role="tablist">
       <a href="#/friends" role="tab" class="${tab === 'feed' ? 'on' : ''}" aria-selected="${tab === 'feed'}">今日動態</a>
       <a href="#/friends/list" role="tab" class="${tab === 'list' ? 'on' : ''}" aria-selected="${tab === 'list'}">好友名單<span class="nav-badge inline" data-badge hidden></span></a>
@@ -866,14 +888,71 @@ async function viewFriends(el, c, sub) {
   applyBadge();
   const body = $('#friends-body', el);
   if (tab === 'feed') {
-    $('[data-refresh]', el).addEventListener('click', (e) => {
-      e.currentTarget.classList.add('spin');
-      paintFeed(body, c).finally(() => e.currentTarget?.classList.remove('spin'));
-    });
+    mountAddButton(el, c);
+    // 沒有重新整理按鈕：每次進來都會載入；回到這個分頁（或切回 App）時，超過 1 分鐘就再更新一次
+    let loadedAt = Date.now();
+    let refreshing = false;
+    const onVisible = () => {
+      if (document.hidden || refreshing || !c.alive || Date.now() - loadedAt < 60_000) return;
+      refreshing = true;
+      paintFeed(body, c)
+        .then(() => { loadedAt = Date.now(); })
+        .catch((e) => console.warn('feed refresh failed', e))
+        .finally(() => { refreshing = false; });
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    c.onDispose(() => document.removeEventListener('visibilitychange', onVisible));
     await paintFeed(body, c);
+    loadedAt = Date.now();
   } else {
     await paintFriendList(body, c);
   }
+}
+
+/** 首頁右下角的液態玻璃「＋」：新增今天的畫（上傳圖片或隨手畫），做法和「今天」頁完全一樣 */
+function mountAddButton(el, c) {
+  el.classList.add('has-fab');
+  el.insertAdjacentHTML('beforeend', `
+    <button class="fab" type="button" data-fab aria-label="新增今天的畫" aria-haspopup="dialog">${icon('plus', 28)}</button>
+    <input type="file" data-fab-file accept="image/*" multiple hidden>`);
+  const fab = $('[data-fab]', el);
+  const input = $('[data-fab-file]', el);
+  const add = (blobs, source) => addAndShareToday(blobs, source, { link: true });
+
+  input.addEventListener('change', () => {
+    const files = [...input.files];
+    input.value = '';
+    if (files.length) add(files, 'upload');
+  });
+
+  fab.addEventListener('click', () => {
+    const m = openModal({
+      title: '新增今天的畫',
+      className: 'modal-small',
+      content: `<div class="add-choices">
+        <button type="button" class="add-choice" data-choose="upload">
+          <span class="add-choice-ico">${icon('upload', 24)}</span>
+          <span><b>上傳圖片</b><span class="muted small">從相簿或檔案選一張或多張</span></span>
+        </button>
+        <button type="button" class="add-choice" data-choose="sketch">
+          <span class="add-choice-ico">${icon('pen', 24)}</span>
+          <span><b>隨手畫</b><span class="muted small">直接在畫板上畫一張</span></span>
+        </button>
+      </div>`,
+    });
+    m.body.addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-choose]');
+      if (!b) return;
+      if (b.dataset.choose === 'upload') {
+        input.click(); // 必須在點擊的當下呼叫，瀏覽器才允許開啟選檔視窗
+        m.close(true);
+      } else {
+        m.close(true);
+        const blob = await openSketchPad();
+        if (blob) add([blob], 'sketch');
+      }
+    });
+  });
 }
 
 async function paintFeed(body, c) {
@@ -1415,12 +1494,20 @@ async function viewMe(el, c) {
 
   el.innerHTML = `
     <section class="card profile-card">
-      ${avatar(me, 64)}
+      <button class="avatar-edit" data-avatar aria-label="更換大頭貼">
+        ${avatar(me, 72)}
+        <span class="avatar-edit-badge" aria-hidden="true">${icon('image', 14)}</span>
+      </button>
       <div class="profile-main">
         <h1>${esc(me.displayName)}</h1>
         <p class="muted">@${esc(me.username)}</p>
       </div>
-      <button class="btn btn-small" data-edit-name>${icon('pen', 16)}<span>修改暱稱</span></button>
+      <div class="profile-actions">
+        <button class="btn btn-small" data-avatar>${icon('image', 16)}<span>更換大頭貼</span></button>
+        <button class="btn btn-small" data-edit-name>${icon('pen', 16)}<span>修改暱稱</span></button>
+        ${me.avatar ? `<button class="btn btn-small btn-ghost" data-avatar-remove>移除大頭貼</button>` : ''}
+      </div>
+      <input type="file" id="avatar-input" accept="image/*" hidden>
     </section>
 
     <div class="stats">
@@ -1481,11 +1568,33 @@ async function viewMe(el, c) {
     <p class="foot muted small">${isDemo() ? '示範模式 · 資料只存在這台裝置' : '雲端模式 · Supabase'} · Art Day</p>`;
 
   const importInput = $('#import-input', el);
+  const avatarInput = $('#avatar-input', el);
+
+  avatarInput.addEventListener('change', async () => {
+    const file = avatarInput.files[0];
+    avatarInput.value = '';
+    if (!file) return;
+    try {
+      const url = await makeAvatar(file);
+      state.me = await state.backend.updateProfile({ avatar: url });
+      toast('已更新大頭貼');
+      render();
+    } catch (err) { avatarError(err); }
+  });
 
   el.addEventListener('click', async (e) => {
     const b = e.target.closest('button');
     if (!b) return;
-    if (b.hasAttribute('data-copy')) {
+    if (b.hasAttribute('data-avatar')) {
+      avatarInput.click();
+    } else if (b.hasAttribute('data-avatar-remove')) {
+      setBusy(b, true);
+      try {
+        state.me = await state.backend.updateProfile({ avatar: null });
+        toast('已移除大頭貼');
+        render();
+      } catch (err) { setBusy(b, false); avatarError(err); }
+    } else if (b.hasAttribute('data-copy')) {
       if (await copyText(link)) toast('邀請連結已複製');
     } else if (b.hasAttribute('data-edit-name')) {
       editName();
@@ -1536,6 +1645,20 @@ async function viewMe(el, c) {
       toast(err instanceof SyntaxError ? '檔案格式不正確' : (err.message || '匯入失敗'), 'error');
     }
   });
+}
+
+function avatarError(err) {
+  console.warn(err);
+  if (err?.code === 'AVATAR_UNSUPPORTED') {
+    openModal({
+      title: '大頭貼功能還沒開啟',
+      className: 'modal-small',
+      content: `<p class="confirm-text">雲端資料庫還沒有大頭貼的欄位。請網站管理員到 Supabase 的 SQL Editor，把最新的 <code>supabase/schema.sql</code> 整份再執行一次（可重複執行，不會刪掉資料），就能使用了。</p>
+        <div class="modal-foot"><button class="btn btn-primary" data-close>知道了</button></div>`,
+    });
+  } else {
+    toast(err?.message || '大頭貼更新失敗', 'error');
+  }
 }
 
 function editRecovery(isSet) {
