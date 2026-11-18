@@ -10,6 +10,7 @@ import { esc, toast, openModal, confirmDialog, avatar, uuid, debounce, copyText,
 import { openSketchPad } from './sketch.js';
 import { ANIMALS, checkRecoveryInput, SCHOOL_MAX, MSG as RECOVERY_MSG } from './recovery.js';
 import { openDrawingModal, commentHtml } from './drawing-modal.js';
+import { cameraMode, openCameraModal } from './camera.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -570,11 +571,46 @@ async function pushDrawing(rec) {
  *   link          成功提示附上「查看」連結，點了到「日曆」頁（今天）
  */
 let addChain = Promise.resolve();
+let addsInFlight = 0;
 function addAndShareToday(blobs, source, opts = {}) {
   const run = () => addAndShareNow(blobs, source, opts);
+  addsInFlight++;
   const p = addChain.then(run, run);
   addChain = p.catch(() => {});
+  addChain.then(() => { addsInFlight--; });
   return p;
+}
+
+/**
+ * 加圖片用的隱藏 <input>（放在畫面裡，點擊當下同步呼叫 .click()，手機瀏覽器才允許開啟）：
+ *   pick() 上傳圖片：相簿或檔案，可多選（沒有 capture）
+ *   take() 拍照：手機開系統相機（capture=environment，單張）；電腦開網頁內建的相機視窗
+ * 選好的檔案交給 onFiles(files, source)；選完會清掉 value，同一張照片可以再拍／再選。
+ */
+function mountPhotoInputs(host, onFiles) {
+  const mode = cameraMode();
+  host.insertAdjacentHTML('beforeend', `
+    <input type="file" accept="image/*" multiple hidden data-pick>
+    ${mode ? '<input type="file" accept="image/*" capture="environment" hidden data-camera>' : ''}`);
+  const pick = $(':scope > [data-pick]', host);
+  const cam = $(':scope > [data-camera]', host);
+  const wire = (input, source) => input?.addEventListener('change', () => {
+    const files = [...input.files];
+    input.value = '';
+    if (files.length) onFiles(files, source);
+  });
+  wire(pick, 'upload');
+  wire(cam, 'camera');
+  return {
+    canTake: !!mode,
+    pick: () => pick.click(),
+    take() {
+      if (mode === 'native') cam.click();
+      else if (mode === 'modal') {
+        openCameraModal({ onFallback: () => pick.click() }).then((blob) => { if (blob) onFiles([blob], 'camera'); });
+      }
+    },
+  };
 }
 
 async function addAndShareNow(blobs, source, { onPending, onChange, alive = () => true, link = false } = {}) {
@@ -725,7 +761,6 @@ async function mountToday(el, c, onData = () => {}) {
         <span class="muted small" id="today-count"></span>
       </div>
       <div class="grid" id="today-grid"></div>
-      <input type="file" id="file-input" accept="image/*" multiple hidden>
       <div class="drop-hint">${icon('upload', 28)}<span>放開就加入今天</span></div>
     </section>
 
@@ -741,7 +776,6 @@ async function mountToday(el, c, onData = () => {}) {
     </section>`;
 
   const grid = $('#today-grid', el);
-  const fileInput = $('#file-input', el);
   const noteEl = $('#note', el);
   const noteState = $('#note-state', el);
   const chipText = $('#cloud-chip span', el);
@@ -789,7 +823,8 @@ async function mountToday(el, c, onData = () => {}) {
       </figure>`;
     }).join('')
       + Array.from({ length: processing }, () => `<div class="tile tile-loading">${spinner}<span>處理中</span></div>`).join('')
-      + `<button class="tile add-tile" data-upload>${icon('upload', 26)}<span>上傳圖片</span></button>
+      + `${photo.canTake ? `<button class="tile add-tile" data-camera>${icon('camera', 26)}<span>拍照</span></button>` : ''}
+         <button class="tile add-tile" data-upload>${icon('upload', 26)}<span>上傳圖片</span></button>
          <button class="tile add-tile" data-sketch>${icon('pen', 26)}<span>隨手畫</span></button>`;
   }
 
@@ -799,10 +834,13 @@ async function mountToday(el, c, onData = () => {}) {
     alive: () => c.alive,
   });
 
+  const photo = mountPhotoInputs($('#drop-zone', el), addAndShare);
+
   grid.addEventListener('click', async (e) => {
     const t = e.target.closest('button');
     if (!t) return;
-    if (t.hasAttribute('data-upload')) fileInput.click();
+    if (t.hasAttribute('data-camera')) photo.take();
+    else if (t.hasAttribute('data-upload')) photo.pick();
     else if (t.hasAttribute('data-sketch')) {
       const blob = await openSketchPad();
       if (blob) addAndShare([blob], 'sketch');
@@ -832,12 +870,6 @@ async function mountToday(el, c, onData = () => {}) {
       try { await removeDrawing(d); toast('已刪除'); } catch (err) { toast(err.message || '刪除失敗', 'error'); }
       paintGrid();
     }
-  });
-
-  fileInput.addEventListener('change', () => {
-    const files = [...fileInput.files];
-    fileInput.value = '';
-    if (files.length) addAndShare(files, 'upload');
   });
 
   // 拖放上傳
@@ -902,17 +934,21 @@ async function viewFriends(el, c, sub) {
       <a href="#/friends" role="tab" class="${tab === 'feed' ? 'on' : ''}" aria-selected="${tab === 'feed'}">今日動態</a>
       <a href="#/friends/list" role="tab" class="${tab === 'list' ? 'on' : ''}" aria-selected="${tab === 'list'}">好友名單<span class="nav-badge inline" data-badge hidden></span></a>
     </div>
+    ${tab === 'feed' ? '<div id="mine-slot"></div>' : ''}
     <div id="friends-body"><div class="loading">${spinner}<span>載入中…</span></div></div>`;
   applyBadge();
   const body = $('#friends-body', el);
   if (tab === 'feed') {
-    mountAddButton(el, c);
+    const mine = mountMine($('#mine-slot', el), c);
+    mine.photo = mountAddButton(el, c, mine);
+    mine.repaint();
     // 沒有重新整理按鈕：每次進來都會載入；回到這個分頁（或切回 App）時，超過 1 分鐘就再更新一次
     let loadedAt = Date.now();
     let refreshing = false;
     const onVisible = () => {
       if (document.hidden || refreshing || !c.alive || Date.now() - loadedAt < 60_000) return;
       refreshing = true;
+      mine.repaint();
       paintFeed(body, c)
         .then(() => { loadedAt = Date.now(); })
         .catch((e) => console.warn('feed refresh failed', e))
@@ -920,6 +956,11 @@ async function viewFriends(el, c, sub) {
     };
     document.addEventListener('visibilitychange', onVisible);
     c.onDispose(() => document.removeEventListener('visibilitychange', onVisible));
+    // 在別台裝置畫的、或還沒上傳的，也順手同步進來（有新增在進行時先不做，避免重複處理）
+    if (!addsInFlight) {
+      syncToday().then(({ changed, note }) => { if (c.alive && (changed || note)) mine.repaint(); })
+        .catch((e) => console.warn('sync failed', e));
+    }
     await paintFeed(body, c);
     loadedAt = Date.now();
   } else {
@@ -927,27 +968,32 @@ async function viewFriends(el, c, sub) {
   }
 }
 
-/** 首頁右下角的液態玻璃「＋」：新增今天的畫（上傳圖片或隨手畫），做法和日曆頁的「今天」完全一樣 */
-function mountAddButton(el, c) {
+/** 首頁右下角的液態玻璃「＋」：新增今天的畫（拍照、上傳圖片或隨手畫），做法和日曆頁的「今天」完全一樣。回傳 photo 控制（給「我的」卡片的捷徑用） */
+function mountAddButton(el, c, mine) {
   el.classList.add('has-fab');
   el.insertAdjacentHTML('beforeend', `
-    <button class="fab" type="button" data-fab aria-label="新增今天的畫" aria-haspopup="dialog">${icon('plus', 28)}</button>
-    <input type="file" data-fab-file accept="image/*" multiple hidden>`);
+    <button class="fab" type="button" data-fab aria-label="新增今天的畫" aria-haspopup="dialog">${icon('plus', 28)}</button>`);
   const fab = $('[data-fab]', el);
-  const input = $('[data-fab-file]', el);
-  const add = (blobs, source) => addAndShareToday(blobs, source, { link: true });
-
-  input.addEventListener('change', () => {
-    const files = [...input.files];
-    input.value = '';
-    if (files.length) add(files, 'upload');
+  const add = (blobs, source) => addAndShareToday(blobs, source, {
+    link: true,
+    onPending: (n) => mine.pending(n),
+    onChange: () => (c.alive ? mine.repaint() : null),
   });
+  const photo = mountPhotoInputs(el, add);
+  mine.sketch = async () => {
+    const blob = await openSketchPad();
+    if (blob) add([blob], 'sketch');
+  };
 
   fab.addEventListener('click', () => {
     const m = openModal({
       title: '新增今天的畫',
       className: 'modal-small',
       content: `<div class="add-choices">
+        ${photo.canTake ? `<button type="button" class="add-choice" data-choose="camera">
+          <span class="add-choice-ico">${icon('camera', 24)}</span>
+          <span><b>拍照</b><span class="muted small">用相機拍下手邊的畫</span></span>
+        </button>` : ''}
         <button type="button" class="add-choice" data-choose="upload">
           <span class="add-choice-ico">${icon('upload', 24)}</span>
           <span><b>上傳圖片</b><span class="muted small">從相簿或檔案選一張或多張</span></span>
@@ -958,19 +1004,123 @@ function mountAddButton(el, c) {
         </button>
       </div>`,
     });
-    m.body.addEventListener('click', async (e) => {
+    m.body.addEventListener('click', (e) => {
       const b = e.target.closest('[data-choose]');
       if (!b) return;
-      if (b.dataset.choose === 'upload') {
-        input.click(); // 必須在點擊的當下呼叫，瀏覽器才允許開啟選檔視窗
-        m.close(true);
-      } else {
-        m.close(true);
-        const blob = await openSketchPad();
-        if (blob) add([blob], 'sketch');
-      }
+      // 開啟相機／選檔視窗必須在點擊的當下同步呼叫，瀏覽器才允許
+      if (b.dataset.choose === 'camera') photo.take();
+      else if (b.dataset.choose === 'upload') photo.pick();
+      m.close(true);
+      if (b.dataset.choose === 'sketch') mine.sketch();
     });
   });
+  return photo;
+}
+
+/**
+ * 首頁最上面「我自己」的今天：本機的今天的畫（原圖）與今日記錄，好友留言數，點圖片可看大圖與留言。
+ * 還沒畫時顯示一張精簡的提示卡。repaint() 會重畫（新增圖片時由 addAndShareToday 的 onChange 呼叫）。
+ */
+function mountMine(slot, c) {
+  const me = state.me;
+  let seq = 0;
+  let kctx = null;
+  let drawings = [];
+  let counts = new Map();
+  let processing = 0;
+  const api = {
+    photo: null,
+    sketch: null,
+    pending(n) { processing = Math.max(0, processing + n); },
+    repaint,
+  };
+
+  async function refreshCounts() {
+    const ids = drawings.filter((d) => d.cloud === 'synced').map((d) => d.id);
+    if (!ids.length || !c.alive) return;
+    const list = await loadComments(ids, { mine: true });
+    if (!c.alive || list.failed) return;
+    counts = countBy(list);
+    for (const id of ids) setCmtBadge(slot, id, counts.get(id) || 0);
+  }
+
+  function html(list, note, k) {
+    const n = list.length;
+    if (!n && !note.trim() && !processing) {
+      return `<article class="post post-mine mine-empty">
+        <div class="mine-empty-head">
+          ${avatar(me, 42)}
+          <div class="post-who"><b>你今天還沒畫</b><span class="muted small">拍一張或畫一張，和朋友分享吧</span></div>
+        </div>
+        <div class="mine-empty-actions">
+          ${api.photo?.canTake ? `<button type="button" class="btn btn-small" data-mine-take>${icon('camera', 18)}<span>拍照</span></button>` : ''}
+          <button type="button" class="btn btn-small" data-mine-pick>${icon('upload', 18)}<span>上傳</span></button>
+        </div>
+      </article>`;
+    }
+    const last = Math.max(0, ...list.map((d) => d.createdAt || 0));
+    const meta = [n ? `${n} 張畫` : '寫了一段話', last ? formatTime(last) : ''].filter(Boolean).join(' · ');
+    const single = n === 1 && !processing ? list[0] : null;
+    return `<article class="post post-mine">
+      <header class="post-head">
+        ${avatar(me, 42)}
+        <div class="post-who"><b>${esc(me.displayName)}<span class="me-tag">我</span></b><span class="muted small">@${esc(me.username)} · ${meta}</span></div>
+      </header>
+      ${n || processing ? `<div class="post-grid ${single ? 'single' : ''}">
+        ${list.map((d) => {
+          const s = STATUS[d.cloud] || STATUS.local;
+          return `<button class="post-img loaded" data-mine-view="${esc(d.id)}" aria-label="查看大圖與留言"
+            ${single && d.width && d.height ? `style="aspect-ratio:${d.width}/${d.height}"` : ''}>
+            <img src="${k.url(d.blob)}" alt="我今天的畫">
+            ${d.cloud === 'synced' ? cmtBadge(d.id, counts.get(d.id) || 0) : `<span class="badge ${s.cls}">${icon(s.ico, 14)}<span>${d.cloud === 'pending' ? '未同步' : s.text}</span></span>`}
+          </button>`;
+        }).join('')}
+        ${Array.from({ length: processing }, () => '<div class="post-img post-loading" role="status" aria-label="處理中"></div>').join('')}
+      </div>` : ''}
+      ${note.trim() ? `<p class="post-note">${esc(note)}</p>` : ''}
+    </article>`;
+  }
+
+  async function repaint() {
+    const mySeq = ++seq;
+    const day = dayKey();
+    let list = [];
+    let note = '';
+    try {
+      [list, note] = await Promise.all([archive.drawingsOfDay(me.id, day), archive.getNote(me.id, day)]);
+    } catch (e) { console.warn('own post unavailable', e); return; }
+    if (!c.alive || mySeq !== seq) return; // 畫面已離開，或有更新的重畫
+    const k = subCtx(c);
+    drawings = list;
+    slot.innerHTML = html(list, note || '', k);
+    kctx?.dispose();
+    kctx = k;
+    refreshCounts();
+  }
+
+  slot.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.hasAttribute('data-mine-take')) api.photo?.take();
+    else if (b.hasAttribute('data-mine-pick')) api.photo?.pick();
+    else if (b.dataset.mineView) {
+      const d = drawings.find((x) => x.id === b.dataset.mineView);
+      if (!d) return;
+      openDrawingModal({
+        title: `${me.displayName} · 今天 ${formatTime(d.createdAt)}`,
+        src: c.url(d.blob), // 用整個頁面的網址：重畫時不會被收掉
+        alt: '我今天的畫',
+        drawingId: d.cloud === 'synced' ? d.id : null,
+        me,
+        isOwner: true,
+        actions: commentActions(true),
+        onCount: (n) => { counts.set(d.id, n); setCmtBadge(slot, d.id, n); },
+        onDownload: () => downloadBlob(d.blob, `art-day-${d.day}-${formatTime(d.createdAt).replace(':', '')}.jpg`),
+      });
+    }
+  });
+
+  return api;
 }
 
 async function paintFeed(body, c) {
