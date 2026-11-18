@@ -8,6 +8,7 @@ import { icon } from './icons.js';
 import { dayKey, addDays, endOfDay, dayParts, formatDayLong, timeLeftToday, formatTime } from './dates.js';
 import { esc, toast, openModal, confirmDialog, lightbox, avatar, uuid, debounce, copyText, downloadBlob, setBusy } from './ui.js';
 import { openSketchPad } from './sketch.js';
+import { ANIMALS, checkRecoveryInput, SCHOOL_MAX, MSG as RECOVERY_MSG } from './recovery.js';
 import { openDrawingModal, commentHtml } from './drawing-modal.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -292,15 +293,20 @@ function renderAuth() {
     form.innerHTML = mode === 'signup'
       ? `${field('displayName', '暱稱', 'maxlength="30" required placeholder="朋友看到的名字" autocomplete="nickname"')}
          ${field('username', '使用者 ID', `${userAttrs} maxlength="20"`, '3–20 個英文小寫、數字或底線，朋友用它找到你，之後不能修改')}
-         ${field('password', '密碼', 'type="password" autocomplete="new-password" minlength="6" required placeholder="至少 6 個字元"', '不需要信箱，所以忘記密碼無法自行重設，請記好')}
+         ${field('password', '密碼', 'type="password" autocomplete="new-password" minlength="6" required placeholder="至少 6 個字元"', '不需要信箱。下一步可以設定兩個問題，忘記密碼時用來重設（可跳過）')}
          <p class="form-error" role="alert" hidden></p>
          <button class="btn btn-primary btn-block" type="submit">建立帳號</button>`
       : `${field('username', '使用者 ID', userAttrs)}
          ${field('password', '密碼', 'type="password" autocomplete="current-password" required')}
+         <p class="auth-aux"><button type="button" class="link-btn" data-forgot>忘記密碼？</button></p>
          <p class="form-error" role="alert" hidden></p>
          <button class="btn btn-primary btn-block" type="submit">登入</button>`;
   }
   paint();
+
+  form.addEventListener('click', (e) => {
+    if (e.target.closest('[data-forgot]')) openForgotPassword(form.elements.username?.value);
+  });
 
   $('.segmented').addEventListener('click', (e) => {
     const b = e.target.closest('[data-mode]');
@@ -328,7 +334,8 @@ function renderAuth() {
         const res = await state.backend.signUp({ password, username, displayName });
         localStorage.setItem('artday.hasAccount', '1');
         state.me = res.user;
-        toast(`歡迎，${state.me.displayName}！`);
+        showRecoveryStep();
+        return;
       } else {
         if (!username) return fail('請填寫使用者 ID');
         if (!password) return fail('請填寫密碼');
@@ -343,6 +350,153 @@ function renderAuth() {
       fail(ex.message || '發生錯誤，請再試一次');
     }
   });
+}
+
+/** 註冊成功後的第二步：設定忘記密碼的兩個問題（可跳過），之後都會進到 App */
+function showRecoveryStep() {
+  const card = $('.auth-card');
+  const done = () => { toast(`歡迎，${state.me.displayName}！`); render(); };
+  card.innerHTML = `
+    <div class="auth-brand">${brandMark(46)}<div><h1>帳號建好了</h1><p>${esc(state.me.displayName)} · @${esc(state.me.username)}</p></div></div>
+    <h2 class="auth-step-title">設定忘記密碼的問題（可跳過）</h2>
+    <p class="auth-note">因為沒有綁定信箱，萬一忘記密碼，要靠這兩個問題重設。<b>兩題都答對才能重設</b>，答案經過加密，連管理者也看不到。</p>
+    <form class="auth-form" id="recovery-step" novalidate>
+      ${recoveryFieldsHtml()}
+      <p class="form-error" role="alert" hidden></p>
+      <button class="btn btn-primary btn-block" type="submit">儲存</button>
+      <button class="btn btn-ghost btn-block" type="button" data-skip>先跳過</button>
+    </form>
+    <p class="field-hint auth-foot">之後也可以到「我的」設定或修改。</p>`;
+  const form = $('#recovery-step', card);
+  $('[data-skip]', form).addEventListener('click', done);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const err = $('.form-error', form);
+    const btn = $('button[type="submit"]', form);
+    const { animal, school } = Object.fromEntries(new FormData(form));
+    const bad = checkRecoveryInput(animal, school);
+    err.hidden = !bad; err.textContent = bad;
+    if (bad) return;
+    setBusy(btn, true, '儲存中…');
+    try {
+      await state.backend.setRecoveryAnswers(animal, school);
+      done();
+    } catch (ex) {
+      console.warn(ex);
+      setBusy(btn, false);
+      err.textContent = `${ex.message || '儲存失敗'}。也可以先跳過，之後到「我的」再設定。`;
+      err.hidden = false;
+    }
+  });
+}
+
+/** 兩個問題的欄位（註冊第二步、設定、忘記密碼共用） */
+function recoveryFieldsHtml() {
+  return `
+    <label class="field"><span class="field-label">最喜歡的動物</span>
+      <select name="animal" required>
+        <option value="">請選擇</option>
+        ${ANIMALS.map((a) => `<option value="${a.key}">${esc(a.label)}</option>`).join('')}
+      </select></label>
+    <label class="field"><span class="field-label">你是什麼國小畢業的</span>
+      <input name="school" maxlength="${SCHOOL_MAX}" autocomplete="off" autocapitalize="none" spellcheck="false" required placeholder="例如 大安國小">
+      <span class="field-hint">重設密碼時要寫得一樣（「國小」可寫可不寫）</span></label>`;
+}
+
+const RESET_ERRORS = {
+  wrong: '答案不太對，請再確認一下。連續答錯 5 次，這個帳號會暫時鎖住 24 小時',
+  locked: '答錯的次數太多了，這個帳號暫時無法重設，請 24 小時後再試，或聯絡網站管理員',
+  weak_password: '新密碼至少需要 6 個字元',
+};
+
+/** 登入畫面的「忘記密碼？」：先確認有沒有設定問題，再回答問題並設定新密碼 */
+function openForgotPassword(prefill = '') {
+  const m = openModal({ title: '忘記密碼', className: 'modal-small', content: '' });
+  const body = m.body;
+  const showError = (form, msg) => { const el = $('.form-error', form); el.textContent = msg; el.hidden = !msg; };
+
+  function stepUser() {
+    body.innerHTML = `<form class="stack" novalidate>
+      <p class="muted small">輸入你的使用者 ID，我們會確認你有沒有設定過忘記密碼的問題。</p>
+      <label class="field"><span class="field-label">使用者 ID</span>
+        <span class="input-adorn"><span>@</span><input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="20" autofocus></span></label>
+      <p class="form-error" role="alert" hidden></p>
+      <div class="modal-foot"><button type="button" class="btn" data-close>取消</button><button class="btn btn-primary" type="submit">下一步</button></div>
+    </form>`;
+    const form = $('form', body);
+    form.elements.username.value = (prefill || '').trim();
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = form.elements.username.value.trim().replace(/^@/, '').toLowerCase();
+      if (!username) return showError(form, '請填寫使用者 ID');
+      const btn = $('button[type="submit"]', form);
+      setBusy(btn, true, '確認中…');
+      try {
+        const ok = await state.backend.recoveryAvailable(username);
+        if (ok) stepAnswers(username); else stepNone(username);
+      } catch (ex) {
+        console.warn(ex);
+        setBusy(btn, false);
+        showError(form, ex.message || RECOVERY_MSG.resetFailed);
+      }
+    });
+  }
+
+  function stepNone() {
+    body.innerHTML = `<div class="stack">
+      <p class="confirm-text">這個帳號沒有設定忘記密碼的問題，所以無法自己重設。請聯絡網站管理員，請他幫你重設密碼。</p>
+      <div class="modal-foot"><button class="btn" data-back>換一個 ID</button><button class="btn btn-primary" data-close>知道了</button></div></div>`;
+    $('[data-back]', body).addEventListener('click', stepUser);
+  }
+
+  function stepAnswers(username) {
+    body.innerHTML = `<form class="stack" novalidate>
+      <p class="muted small">@${esc(username)}，請回答你當初設定的兩個問題，再設定新密碼。</p>
+      ${recoveryFieldsHtml()}
+      <label class="field"><span class="field-label">新密碼</span>
+        <input name="newPassword" type="password" autocomplete="new-password" minlength="6" required placeholder="至少 6 個字元"></label>
+      <label class="field"><span class="field-label">再輸入一次新密碼</span>
+        <input name="confirm" type="password" autocomplete="new-password" required></label>
+      <p class="form-error" role="alert" hidden></p>
+      <div class="modal-foot"><button type="button" class="btn" data-close>取消</button><button class="btn btn-primary" type="submit">重設密碼</button></div>
+    </form>`;
+    const form = $('form', body);
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const { animal, school, newPassword, confirm } = Object.fromEntries(new FormData(form));
+      const bad = checkRecoveryInput(animal, school)
+        || (newPassword.length < 6 ? RESET_ERRORS.weak_password : '')
+        || (newPassword !== confirm ? '兩次輸入的新密碼不一樣' : '');
+      showError(form, bad);
+      if (bad) return;
+      const btn = $('button[type="submit"]', form);
+      setBusy(btn, true, '重設中…');
+      try {
+        const status = await state.backend.resetPassword({ username, animal, school, newPassword });
+        if (status !== 'ok') { setBusy(btn, false); return showError(form, RESET_ERRORS[status] || RECOVERY_MSG.resetFailed); }
+      } catch (ex) {
+        console.warn(ex);
+        setBusy(btn, false);
+        return showError(form, ex.message || RECOVERY_MSG.resetFailed);
+      }
+      try {
+        state.me = await state.backend.signIn({ login: username, password: newPassword });
+        localStorage.setItem('artday.hasAccount', '1');
+        m.close(true);
+        toast('密碼已重設，歡迎回來！');
+        render();
+      } catch (ex) {
+        console.warn(ex);
+        m.close(true);
+        toast('密碼已重設，請用新密碼登入');
+        const u = $('.auth-form input[name="username"]');
+        if (u) u.value = username;
+        $('.auth-form input[name="password"]')?.focus();
+      }
+    });
+  }
+
+  stepUser();
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1249,10 +1403,11 @@ function formatBytes(n) {
 
 async function viewMe(el, c) {
   const me = state.me;
-  const [act, est, persisted] = await Promise.all([
+  const [act, est, persisted, recovery] = await Promise.all([
     archive.activity(me.id),
     navigator.storage?.estimate?.().catch(() => null),
     navigator.storage?.persisted?.().catch(() => false),
+    state.backend.recoveryStatus().catch((e) => { console.warn(e); return { supported: false }; }),
   ]);
   if (!c.alive) return;
   const streak = streakOf(act.drawingDays, state.today);
@@ -1281,6 +1436,20 @@ async function viewMe(el, c) {
         <button class="btn btn-small" data-copy>${icon('copy', 16)}<span>複製</span></button>
       </div>
     </section>
+
+    ${recovery.supported ? `<section class="section" data-recovery>
+      <h2>忘記密碼的問題</h2>
+      <div class="card stack">
+        <p>沒有綁定信箱，所以忘記密碼時要靠「最喜歡的動物」和「畢業的國小」兩個問題重設。兩題都答對才行，答案已加密，不會顯示給任何人。</p>
+        <div class="kv"><span>目前狀態</span>
+          ${recovery.hasAnswers ? `<b class="ok-text">${icon('shield', 16)} 已設定</b>` : '<b class="muted">尚未設定</b>'}</div>
+        ${recovery.hasAnswers && recovery.updatedAt ? `<div class="kv"><span>上次更新</span><b>${esc(new Date(recovery.updatedAt).toLocaleDateString('zh-TW', { year: 'numeric', month: 'numeric', day: 'numeric' }))}</b></div>` : ''}
+        <div class="btn-row">
+          <button class="btn ${recovery.hasAnswers ? '' : 'btn-primary'}" data-recovery-set>${recovery.hasAnswers ? '修改' : '設定'}</button>
+          ${recovery.hasAnswers ? '<button class="btn" data-recovery-clear>移除</button>' : ''}
+        </div>
+      </div>
+    </section>` : ''}
 
     <section class="section">
       <h2>本機保存</h2>
@@ -1320,6 +1489,15 @@ async function viewMe(el, c) {
       if (await copyText(link)) toast('邀請連結已複製');
     } else if (b.hasAttribute('data-edit-name')) {
       editName();
+    } else if (b.hasAttribute('data-recovery-set')) {
+      editRecovery(recovery.hasAnswers);
+    } else if (b.hasAttribute('data-recovery-clear')) {
+      if (!(await confirmDialog('移除後，忘記密碼就無法自己重設，只能請網站管理員幫忙。確定要移除嗎？', { title: '移除忘記密碼的問題', ok: '移除', danger: true }))) return;
+      try {
+        await state.backend.clearRecoveryAnswers();
+        toast('已移除');
+        render();
+      } catch (err) { toast(err.message || '移除失敗', 'error'); }
     } else if (b.hasAttribute('data-persist')) {
       const ok = await navigator.storage?.persist?.().catch(() => false);
       toast(ok ? '已開啟保護，瀏覽器不會自動清除你的畫' : '瀏覽器沒有同意。把網站加到主畫面，或常常使用，通常就會允許', ok ? '' : 'error');
@@ -1356,6 +1534,40 @@ async function viewMe(el, c) {
       render();
     } catch (err) {
       toast(err instanceof SyntaxError ? '檔案格式不正確' : (err.message || '匯入失敗'), 'error');
+    }
+  });
+}
+
+function editRecovery(isSet) {
+  const m = openModal({
+    title: isSet ? '修改忘記密碼的問題' : '設定忘記密碼的問題',
+    className: 'modal-small',
+    content: `<form class="stack" id="recovery-form" novalidate>
+      <p class="muted small">${isSet ? '修改時要重新選擇兩個答案。' : ''}忘記密碼時，兩題都答對才能重設。答案經過加密，不會顯示給任何人。</p>
+      ${recoveryFieldsHtml()}
+      <p class="form-error" role="alert" hidden></p>
+      <div class="modal-foot"><button type="button" class="btn" data-close>取消</button><button class="btn btn-primary" type="submit">儲存</button></div>
+    </form>`,
+  });
+  const form = $('#recovery-form', m.body);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const err = $('.form-error', form);
+    const { animal, school } = Object.fromEntries(new FormData(form));
+    const bad = checkRecoveryInput(animal, school);
+    err.hidden = !bad; err.textContent = bad;
+    if (bad) return;
+    const btn = $('button[type="submit"]', form);
+    setBusy(btn, true, '儲存中…');
+    try {
+      await state.backend.setRecoveryAnswers(animal, school);
+      m.close(true);
+      toast('已儲存忘記密碼的問題');
+      render();
+    } catch (ex) {
+      setBusy(btn, false);
+      err.textContent = ex.message || '儲存失敗';
+      err.hidden = false;
     }
   });
 }

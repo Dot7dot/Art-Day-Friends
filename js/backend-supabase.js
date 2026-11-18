@@ -1,6 +1,8 @@
 // 雲端模式：使用 Supabase（免費方案即可）
 // 資料表與安全規則見 supabase/schema.sql
 
+import { MSG } from './recovery.js';
+
 const LIB = '../vendor/supabase-js-2.117.3.mjs';
 
 // 註冊不需要信箱：Supabase 登入一定要有 email 欄位，所以用「使用者 ID」組出一個
@@ -37,6 +39,10 @@ function check({ data, error }) {
   if (error) throw friendly(error);
   return data;
 }
+
+// 資料庫還沒執行最新 schema.sql（找不到函式）
+const isMissingFn = (e) => /PGRST20[25]|42883|42P01|schema cache|does not exist/i.test(`${e?.code || ''} ${e?.cause?.code || ''} ${e?.cause?.message || e?.message || ''}`);
+const RECOVERY_UNSUPPORTED = Object.assign(new Error(MSG.unsupported), { code: 'RECOVERY_UNSUPPORTED' });
 
 const COMMENT_COLS = 'id, drawing_id, day, body, created_at, author';
 const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
@@ -142,6 +148,55 @@ export async function createSupabaseBackend(url, anonKey) {
         .select('id, username, display_name').single());
       me = mapProfile(p);
       return me;
+    },
+
+    // ── 忘記密碼的問題 ──
+
+    /** { supported, hasAnswers, updatedAt }；資料庫還沒更新時 supported 為 false */
+    async recoveryStatus() {
+      try {
+        const rows = check(await sb.rpc('recovery_status'));
+        const r = Array.isArray(rows) ? rows[0] : rows;
+        return { supported: true, hasAnswers: !!r?.has_answers, updatedAt: r?.updated_at || null };
+      } catch (e) {
+        if (isMissingFn(e)) return { supported: false, hasAnswers: false, updatedAt: null };
+        throw e;
+      }
+    },
+
+    async setRecoveryAnswers(animal, school) {
+      const { error } = await sb.rpc('set_recovery_answers', { animal, school });
+      if (!error) return;
+      if (/invalid recovery animal/i.test(error.message)) throw new Error('請選擇最喜歡的動物');
+      if (/invalid recovery school/i.test(error.message)) throw new Error('請填寫你畢業的國小');
+      if (isMissingFn(error)) throw RECOVERY_UNSUPPORTED;
+      throw friendly(error);
+    },
+
+    async clearRecoveryAnswers() {
+      const { error } = await sb.rpc('clear_recovery_answers');
+      if (error) throw isMissingFn(error) ? RECOVERY_UNSUPPORTED : friendly(error);
+    },
+
+    /** 這個使用者 ID 有沒有設定過問題（登入前使用） */
+    async recoveryAvailable(username) {
+      const { data, error } = await sb.rpc('recovery_available', { username: username.trim().replace(/^@/, '').toLowerCase() });
+      if (error) throw isMissingFn(error) ? RECOVERY_UNSUPPORTED : friendly(error);
+      return !!data;
+    },
+
+    /** 回傳 'ok' | 'wrong' | 'locked' | 'weak_password' */
+    async resetPassword({ username, animal, school, newPassword }) {
+      const { data, error } = await sb.rpc('reset_password_with_answers', {
+        username: username.trim().replace(/^@/, '').toLowerCase(), animal, school, new_password: newPassword,
+      });
+      if (error) {
+        if (isMissingFn(error)) throw RECOVERY_UNSUPPORTED;
+        if (/failed to fetch|networkerror|load failed/i.test(error.message)) throw friendly(error);
+        console.warn(error);
+        throw Object.assign(new Error(MSG.resetFailed), { cause: error });
+      }
+      return String(data);
     },
 
     async findUser(username) {

@@ -479,3 +479,225 @@ exception when others then
   raise notice 'pg_cron 尚未啟用（%）。可到 Dashboard → Integrations → Cron 開啟後再執行一次本檔；不開也沒關係，App 開啟時會自動清除。', sqlerrm;
 end;
 $$;
+
+
+-- ── 7. 忘記密碼：兩個安全問題 ────────────────────────────────────
+-- 帳號沒有信箱，所以讓使用者「選填」兩個問題（最喜歡的動物＋國小），
+-- 忘記密碼時答對就能自己重設。答案只存 bcrypt 雜湊，連管理者都看不到。
+--   • 雜湊的內容是「動物代號|整理過的學校名稱」；整理規則（NFKC、去空白與標點、
+--     臺→台、去掉結尾的國小）與 js/recovery.js 完全相同。
+--   • 兩張表都開 RLS 而且不給任何直接權限，一律透過下面的函式存取。
+--   • 同一個帳號 24 小時內答錯 5 次就先鎖住（回傳 'locked'）。
+--   • 重設失敗時「回傳狀態文字」而不是丟出錯誤，這樣失敗紀錄才不會被 rollback。
+--   需要 pgcrypto（Supabase 內建在 extensions schema）。
+
+create table if not exists public.recovery_answers (
+  user_id     uuid primary key references public.profiles (id) on delete cascade,
+  answer_hash text not null,
+  updated_at  timestamptz not null default now()
+);
+
+create table if not exists public.recovery_attempts (
+  user_id      uuid not null references public.profiles (id) on delete cascade,
+  attempted_at timestamptz not null default now(),
+  success      boolean not null
+);
+
+create index if not exists recovery_attempts_user_idx on public.recovery_attempts (user_id, attempted_at);
+
+alter table public.recovery_answers enable row level security;
+alter table public.recovery_attempts enable row level security;
+-- 刻意不建立任何 policy，並收回所有直接權限
+revoke all on public.recovery_answers from public, anon, authenticated;
+revoke all on public.recovery_attempts from public, anon, authenticated;
+
+-- 可選的動物代號（要和 js/recovery.js 一致）
+create or replace function public.recovery_animals()
+returns text[]
+language sql
+immutable
+set search_path = ''
+as $$
+  select array['poison_dart_frog', 'red_fire_ant', 'tardigrade', 'platypus', 'axolotl',
+               'shoebill', 'tarsier', 'naked_mole_rat', 'mantis_shrimp', 'sunfish'];
+$$;
+
+-- 學校名稱整理：NFKC → 去頭尾空白 → 小寫 → 去掉所有空白與標點 → 臺→台 → 去掉結尾的 國民小學／國小／小學
+-- 可能回傳空字串（呼叫的人要檢查）
+create or replace function public.recovery_norm_school(s text)
+returns text
+language sql
+immutable
+set search_path = ''
+as $$
+  select regexp_replace(
+           replace(
+             regexp_replace(
+               lower(btrim(normalize(coalesce(s, ''), NFKC))),
+               '[\s!-/:-@\[-`{-~ -¿ -⁯⸀-⹿　-〿︰-﹏]', '', 'g'),
+             '臺', '台'),
+           '(國民小學|國小|小學)$', '');
+$$;
+
+create or replace function public.recovery_secret(animal text, school text)
+returns text
+language sql
+immutable
+set search_path = ''
+as $$
+  select coalesce(animal, '') || '|' || public.recovery_norm_school(school);
+$$;
+
+revoke execute on function public.recovery_animals() from public, anon, authenticated;
+revoke execute on function public.recovery_norm_school(text) from public, anon, authenticated;
+revoke execute on function public.recovery_secret(text, text) from public, anon, authenticated;
+
+-- 設定／修改自己的答案
+create or replace function public.set_recovery_answers(animal text, school text)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid := auth.uid();
+begin
+  if uid is null then
+    raise exception 'not signed in';
+  end if;
+  if animal is null or not (animal = any (public.recovery_animals())) then
+    raise exception 'invalid recovery animal';
+  end if;
+  if char_length(public.recovery_norm_school(school)) < 1 or char_length(coalesce(school, '')) > 60 then
+    raise exception 'invalid recovery school';
+  end if;
+  insert into public.recovery_answers (user_id, answer_hash, updated_at)
+  values (uid, extensions.crypt(public.recovery_secret(animal, school), extensions.gen_salt('bf')), now())
+  on conflict (user_id) do update
+    set answer_hash = excluded.answer_hash, updated_at = now();
+end;
+$$;
+
+create or replace function public.clear_recovery_answers()
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  delete from public.recovery_answers where user_id = auth.uid();
+end;
+$$;
+
+create or replace function public.recovery_status()
+returns table (has_answers boolean, updated_at timestamptz)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+begin
+  return query
+    select true, r.updated_at from public.recovery_answers r where r.user_id = auth.uid();
+  if not found then
+    return query select false, null::timestamptz;
+  end if;
+end;
+$$;
+
+-- 這個使用者 ID 有沒有設定過問題（登入前就要能問）
+create or replace function public.recovery_available(username text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+      from public.profiles p
+      join public.recovery_answers r on r.user_id = p.id
+     where p.username = lower(btrim(coalesce(recovery_available.username, '')))
+  );
+$$;
+
+-- 用答案重設密碼。回傳 'ok' | 'wrong' | 'locked' | 'weak_password'
+create or replace function public.reset_password_with_answers(
+  username text, animal text, school text, new_password text)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid;
+  hash text;
+  fails integer;
+begin
+  select p.id, r.answer_hash into uid, hash
+    from public.profiles p
+    left join public.recovery_answers r on r.user_id = p.id
+   where p.username = lower(btrim(coalesce(reset_password_with_answers.username, '')));
+
+  -- 找不到使用者、或沒有設定答案：和答錯同樣回應
+  if uid is null or hash is null then
+    return 'wrong';
+  end if;
+
+  -- 同一個帳號同時嘗試時排隊，避免繞過次數限制
+  perform 1 from public.profiles where id = uid for update;
+
+  delete from public.recovery_attempts where user_id = uid and attempted_at < now() - interval '24 hours';
+  select count(*) into fails from public.recovery_attempts
+   where user_id = uid and not success and attempted_at > now() - interval '24 hours';
+  if fails >= 5 then
+    return 'locked';
+  end if;
+
+  if char_length(coalesce(new_password, '')) < 6 then
+    return 'weak_password';
+  end if;
+
+  if reset_password_with_answers.animal is null or not (reset_password_with_answers.animal = any (public.recovery_animals()))
+     or char_length(public.recovery_norm_school(school)) < 1
+     or hash <> extensions.crypt(public.recovery_secret(animal, school), hash) then
+    insert into public.recovery_attempts (user_id, success) values (uid, false);
+    return 'wrong';
+  end if;
+
+  update auth.users
+     set encrypted_password = extensions.crypt(new_password, extensions.gen_salt('bf')),
+         updated_at = now()
+   where id = uid;
+
+  -- 讓舊的登入失效（資料表不存在或沒權限時略過，不影響重設）
+  begin
+    delete from auth.refresh_tokens where user_id = uid::text;
+  exception when others then
+    null;
+  end;
+  begin
+    delete from auth.sessions where user_id = uid;
+  exception when others then
+    null;
+  end;
+
+  delete from public.recovery_attempts where user_id = uid and not success;
+  insert into public.recovery_attempts (user_id, success) values (uid, true);
+  return 'ok';
+end;
+$$;
+
+revoke execute on function public.set_recovery_answers(text, text) from public, anon;
+revoke execute on function public.clear_recovery_answers() from public, anon;
+revoke execute on function public.recovery_status() from public, anon;
+revoke execute on function public.recovery_available(text) from public;
+revoke execute on function public.reset_password_with_answers(text, text, text, text) from public;
+grant execute on function public.set_recovery_answers(text, text) to authenticated;
+grant execute on function public.clear_recovery_answers() to authenticated;
+grant execute on function public.recovery_status() to authenticated;
+grant execute on function public.recovery_available(text) to anon, authenticated;
+grant execute on function public.reset_password_with_answers(text, text, text, text) to anon, authenticated;
