@@ -5,10 +5,12 @@
 import { openDB, promisify, run } from './idb.js';
 import { dayKey, endOfDay } from './dates.js';
 import { demoArt } from './demo-art.js';
+import { recoverySecret, MAX_FAILED_ATTEMPTS } from './recovery.js';
 
 const K_USERS = 'artday.demo.users';
 const K_SESSION = 'artday.demo.session';
 const K_FRIENDS = 'artday.demo.friendships';
+const K_RECOVERY_FAILS = 'artday.demo.recoveryFails'; // { 使用者id: [答錯的時間（毫秒）] }
 const K_CANNED = 'artday.demo.cannedComments'; // 示範好友已經留過言的畫（每張只留一次）
 
 const DEMO_ARTISTS = [
@@ -208,6 +210,57 @@ export async function createLocalBackend() {
       write(K_USERS, allUsers().map((u) => (u.id === me.id ? { ...u, displayName } : u)));
       me = byId(me.id);
       return me;
+    },
+
+    // ── 忘記密碼的問題（規則同雲端版：答案只存雜湊，24 小時內答錯 5 次就鎖住）──
+
+    async recoveryStatus() {
+      const r = allUsers().find((u) => u.id === me.id)?.recovery;
+      return { supported: true, hasAnswers: !!r, updatedAt: r?.updatedAt || null };
+    },
+
+    async setRecoveryAnswers(animal, school) {
+      const secret = recoverySecret(animal, school);
+      if (!secret) throw new Error('答案不完整，請重新選擇');
+      const salt = randomHex(8);
+      const recovery = { salt, hash: await sha256(`${salt}:${secret}`), updatedAt: nowIso() };
+      write(K_USERS, allUsers().map((u) => (u.id === me.id ? { ...u, recovery } : u)));
+    },
+
+    async clearRecoveryAnswers() {
+      write(K_USERS, allUsers().map((u) => {
+        if (u.id !== me.id) return u;
+        const { recovery, ...rest } = u; // eslint-disable-line no-unused-vars
+        return rest;
+      }));
+    },
+
+    async recoveryAvailable(username) {
+      const name = username.trim().replace(/^@/, '').toLowerCase();
+      return allUsers().some((u) => u.username === name && !u.demo && u.recovery);
+    },
+
+    async resetPassword({ username, animal, school, newPassword }) {
+      const name = username.trim().replace(/^@/, '').toLowerCase();
+      const u = allUsers().find((x) => x.username === name && !x.demo);
+      if (!u || !u.recovery) return 'wrong';
+      const DAY = 864e5;
+      const fails = read(K_RECOVERY_FAILS, {});
+      const recent = (fails[u.id] || []).filter((t) => Date.now() - t < DAY);
+      if (recent.length >= MAX_FAILED_ATTEMPTS) return 'locked';
+      if (newPassword.length < 6) return 'weak_password';
+      const secret = recoverySecret(animal, school);
+      if (!secret || (await sha256(`${u.recovery.salt}:${secret}`)) !== u.recovery.hash) {
+        fails[u.id] = [...recent, Date.now()];
+        write(K_RECOVERY_FAILS, fails);
+        return 'wrong';
+      }
+      const salt = randomHex(8);
+      const hash = await sha256(`${salt}:${newPassword}`);
+      write(K_USERS, allUsers().map((x) => (x.id === u.id ? { ...x, salt, hash } : x)));
+      delete fails[u.id];
+      write(K_RECOVERY_FAILS, fails);
+      return 'ok';
     },
 
     async findUser(username) {
