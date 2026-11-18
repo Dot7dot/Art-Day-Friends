@@ -47,11 +47,22 @@ const RECOVERY_UNSUPPORTED = Object.assign(new Error(MSG.unsupported), { code: '
 const COMMENT_COLS = 'id, drawing_id, day, body, created_at, author';
 const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
 
-const mapProfile = (p) => p && { id: p.id, username: p.username, displayName: p.display_name, avatar: p.avatar || null };
+// sharePublic：自己的檔案才會查這個欄位（別人的不查）。null = 資料庫還沒有這個欄位（還沒更新 schema.sql）
+const mapProfile = (p) => p && {
+  id: p.id, username: p.username, displayName: p.display_name, avatar: p.avatar || null,
+  ...('share_public' in p ? { sharePublic: p.share_public } : {}),
+};
 
 // 資料庫還沒執行最新 schema.sql（profiles 沒有 avatar 欄位）：42703 = 欄位不存在，PGRST204 = PostgREST 找不到欄位
 const isMissingAvatarCol = (e) => !!e && /avatar/i.test(e.message || '')
   && (/^(42703|PGRST204)$/.test(e.code || '') || /column|schema cache/i.test(e.message || ''));
+// 同上：profiles 沒有 share_public 欄位（推薦貼文還沒開啟）
+const isMissingShareCol = (e) => !!e && /share_public/i.test(e.message || '')
+  && (/^(42703|PGRST204)$/.test(e.code || '') || /column|schema cache/i.test(e.message || ''));
+const SHARE_UNSUPPORTED = Object.assign(
+  new Error('推薦功能還沒開啟：請網站管理員到 Supabase SQL Editor 重新執行最新的 supabase/schema.sql'),
+  { code: 'SHARE_UNSUPPORTED' },
+);
 const AVATAR_UNSUPPORTED = Object.assign(
   new Error('大頭貼功能還沒開啟：請網站管理員到 Supabase SQL Editor 重新執行最新的 supabase/schema.sql'),
   { code: 'AVATAR_UNSUPPORTED' },
@@ -73,28 +84,38 @@ export async function createSupabaseBackend(url, anonKey) {
   const imageCache = new Map();
 
   // 查個人檔案時一併取 avatar；資料庫還沒更新時退回不含 avatar 的查詢，並記住（本次使用期間）
+  // self = 這是「我自己」的檔案：多查 share_public（推薦設定）；欄位不存在時同樣退回
   let avatarOk = true;
-  const profileCols = () => (avatarOk ? 'id, username, display_name, avatar' : 'id, username, display_name');
-  async function profileQuery(make) {
-    let res = await make(profileCols());
-    if (res.error && avatarOk && isMissingAvatarCol(res.error)) {
-      avatarOk = false;
-      res = await make(profileCols());
+  let shareOk = true;
+  const profileCols = (self) => ['id, username, display_name', avatarOk && 'avatar', self && shareOk && 'share_public'].filter(Boolean).join(', ');
+  async function profileQuery(make, { self = false } = {}) {
+    let res = await make(profileCols(self));
+    for (let i = 0; i < 2 && res.error; i++) {
+      if (avatarOk && isMissingAvatarCol(res.error)) avatarOk = false;
+      else if (shareOk && isMissingShareCol(res.error)) shareOk = false;
+      else break;
+      res = await make(profileCols(self));
     }
     return check(res);
   }
+  // 欄位不存在時，自己的檔案 sharePublic 為 null（畫面據此隱藏推薦的開關）
+  const mapSelf = (p) => {
+    const m = mapProfile(p);
+    if (m && !('sharePublic' in m)) m.sharePublic = null;
+    return m;
+  };
 
   async function loadProfile(user) {
-    let p = await profileQuery((cols) => sb.from('profiles').select(cols).eq('id', user.id).maybeSingle());
+    let p = await profileQuery((cols) => sb.from('profiles').select(cols).eq('id', user.id).maybeSingle(), { self: true });
     if (!p) {
       // 萬一資料庫觸發器沒建立 profile，這裡補建
       const meta = user.user_metadata || {};
       const username = /^[a-z0-9_]{3,20}$/.test(meta.username || '') ? meta.username : `artist_${user.id.replace(/-/g, '').slice(0, 8)}`;
       p = await profileQuery((cols) => sb.from('profiles')
         .insert({ id: user.id, username, display_name: (meta.display_name || username).slice(0, 30) })
-        .select(cols).single());
+        .select(cols).single(), { self: true });
     }
-    return mapProfile(p);
+    return mapSelf(p);
   }
 
   async function doSignUp({ password, username, displayName }) {
@@ -163,22 +184,28 @@ export async function createSupabaseBackend(url, anonKey) {
       await sb.auth.signOut();
     },
 
-    /** displayName、avatar（data URL，或 null 代表移除）都是選填，沒給的就不動 */
-    async updateProfile({ displayName, avatar } = {}) {
+    /** displayName、avatar（data URL，或 null 代表移除）、sharePublic（出現在推薦）都是選填，沒給的就不動 */
+    async updateProfile({ displayName, avatar, sharePublic } = {}) {
       const patch = {};
       if (displayName !== undefined) patch.display_name = displayName;
+      if (sharePublic !== undefined) {
+        if (!shareOk) throw SHARE_UNSUPPORTED;
+        patch.share_public = !!sharePublic;
+      }
       if (avatar !== undefined) {
         if (!avatarOk) throw AVATAR_UNSUPPORTED;
         patch.avatar = avatar;
       }
       let p;
       try {
-        p = await profileQuery((cols) => sb.from('profiles').update(patch).eq('id', me.id).select(cols).single());
+        p = await profileQuery((cols) => sb.from('profiles').update(patch).eq('id', me.id).select(cols).single(), { self: true });
       } catch (e) {
         if (avatar !== undefined && isMissingAvatarCol(e.cause)) { avatarOk = false; throw AVATAR_UNSUPPORTED; }
+        if (sharePublic !== undefined && isMissingShareCol(e.cause)) { shareOk = false; throw SHARE_UNSUPPORTED; }
         throw e;
       }
-      me = mapProfile(p);
+      if (sharePublic !== undefined && !shareOk) throw SHARE_UNSUPPORTED; // 查詢途中才發現沒有欄位：更新並沒有生效
+      me = mapSelf(p);
       return me;
     },
 
@@ -272,6 +299,35 @@ export async function createSupabaseBackend(url, anonKey) {
     async suggestFriends(limit = 8) {
       const rows = check(await sb.rpc('suggest_friends', { max_count: limit }));
       return (rows || []).map((r) => ({ ...mapProfile(r), mutualCount: r.mutual_count || 0 }));
+    },
+
+    /**
+     * 推薦貼文：不是好友、同意公開分享、今天有畫的人，連同今天的畫（只有資料，圖片之後逐張載入）與文字。
+     * 資料庫還沒更新（沒有 recommended_posts）時丟出錯誤（code PGRST202／42883），畫面就不顯示這一區。
+     */
+    async recommendedPosts(limit = 6) {
+      const rows = check(await sb.rpc('recommended_posts', { max_count: limit })) || [];
+      if (!rows.length) return [];
+      const ids = rows.map((r) => r.user_id);
+      const now = new Date().toISOString();
+      const [drawings, notes] = await Promise.all([
+        sb.from('drawings').select('id, user_id, width, height, created_at').in('user_id', ids).gt('expires_at', now).order('created_at'),
+        sb.from('day_notes').select('user_id, note, updated_at').in('user_id', ids).gt('expires_at', now).order('updated_at', { ascending: false }),
+      ]);
+      const ds = check(drawings);
+      const ns = check(notes);
+      return rows.map((r) => {
+        const mine = ds.filter((d) => d.user_id === r.user_id);
+        const note = ns.find((n) => n.user_id === r.user_id);
+        const times = [...mine.map((d) => d.created_at), note?.updated_at].filter(Boolean).sort();
+        return {
+          profile: mapProfile({ id: r.user_id, username: r.username, display_name: r.display_name, avatar: r.avatar }),
+          mutualCount: r.mutual_count || 0,
+          drawings: mine.map((d) => ({ id: d.id, width: d.width, height: d.height, createdAt: d.created_at })),
+          note: note?.note || '',
+          lastAt: times[times.length - 1] || r.last_at || null,
+        };
+      }).filter((p) => p.drawings.length);
     },
 
     async acceptFriend(otherId) {

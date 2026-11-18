@@ -11,6 +11,7 @@ import { openSketchPad } from './sketch.js';
 import { ANIMALS, checkRecoveryInput, SCHOOL_MAX, MSG as RECOVERY_MSG } from './recovery.js';
 import { openDrawingModal, commentHtml } from './drawing-modal.js';
 import { cameraMode, openCameraModal } from './camera.js';
+import { isIOS, isAndroid, isMobileDevice, isStandalone, albumName, toFile, saveToAlbum, savedMessage, canShareFiles, downloadFiles, getAutoSave, setAutoSave, requestPersistOnce } from './album.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -25,6 +26,27 @@ const state = {
   incoming: 0,
   maintainedDay: null,
 };
+
+// ── 安裝成 App（Android／電腦 Chrome 會送來 beforeinstallprompt；iOS 沒有，要手動「加入主畫面」）──
+let installEvent = null;
+const installWatchers = new Set();
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault(); // 不讓瀏覽器自己跳出來，改在「我的」放一顆按鈕
+  installEvent = e;
+  installWatchers.forEach((fn) => fn());
+});
+window.addEventListener('appinstalled', () => {
+  installEvent = null;
+  installWatchers.forEach((fn) => fn());
+});
+
+// service worker：讓網站可以安裝、離線也打得開（網路優先，更新網站後下次打開就是新版）
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator) || window.isSecureContext === false) return;
+  const reg = () => navigator.serviceWorker.register('sw.js', { scope: './' }).catch((e) => console.warn('service worker', e));
+  if (document.readyState === 'complete') reg(); else window.addEventListener('load', reg, { once: true });
+}
+registerServiceWorker();
 
 const isDemo = () => state.backend?.mode === 'local';
 const inviteLink = (u) => `${location.origin}${location.pathname}#/add/${encodeURIComponent(u)}`;
@@ -378,20 +400,35 @@ function renderAuth() {
 /** 註冊成功後的第二步：設定忘記密碼的兩個問題（可跳過），之後都會進到 App */
 function showRecoveryStep() {
   const card = $('.auth-card');
-  const done = () => { toast(`歡迎，${state.me.displayName}！`); render(); };
+  const canShare = typeof state.me?.sharePublic === 'boolean'; // 資料庫還沒更新時沒有這個欄位：不顯示
+  // 這一步結束時（儲存或跳過）才套用「推薦」的選擇；預設勾選，也可以取消勾選
+  const done = async (form) => {
+    const box = form?.elements.sharePublic;
+    if (box) {
+      try { state.me = await state.backend.updateProfile({ sharePublic: box.checked }); } catch (e) { console.warn(e); }
+    }
+    if (canShare) markRecoCardSeen();
+    toast(`歡迎，${state.me.displayName}！`);
+    render();
+  };
   card.innerHTML = `
     <div class="auth-brand">${brandMark(46)}<div><h1>帳號建好了</h1><p>${esc(state.me.displayName)} · @${esc(state.me.username)}</p></div></div>
     <h2 class="auth-step-title">設定忘記密碼的問題（可跳過）</h2>
     <p class="auth-note">因為沒有綁定信箱，萬一忘記密碼，要靠這兩個問題重設。<b>兩題都答對才能重設</b>，答案經過加密，連管理者也看不到。</p>
     <form class="auth-form" id="recovery-step" novalidate>
       ${recoveryFieldsHtml()}
+      ${canShare ? `<div class="share-choice">
+        <p class="field-label">公開分享（選擇）</p>
+        ${shareSwitchHtml(true)}
+        <p class="field-hint">就算跳過上面的問題，這個選擇也會套用。</p>
+      </div>` : ''}
       <p class="form-error" role="alert" hidden></p>
       <button class="btn btn-primary btn-block" type="submit">儲存</button>
       <button class="btn btn-ghost btn-block" type="button" data-skip>先跳過</button>
     </form>
     <p class="field-hint auth-foot">之後也可以到「我的」設定或修改。</p>`;
   const form = $('#recovery-step', card);
-  $('[data-skip]', form).addEventListener('click', done);
+  $('[data-skip]', form).addEventListener('click', () => done(form));
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const err = $('.form-error', form);
@@ -403,7 +440,7 @@ function showRecoveryStep() {
     setBusy(btn, true, '儲存中…');
     try {
       await state.backend.setRecoveryAnswers(animal, school);
-      done();
+      await done(form);
     } catch (ex) {
       console.warn(ex);
       setBusy(btn, false);
@@ -411,6 +448,15 @@ function showRecoveryStep() {
       err.hidden = false;
     }
   });
+}
+
+/** 「讓我的畫出現在推薦」的開關（註冊第二步、「我的」共用）；名稱 sharePublic，勾選 = 公開 */
+function shareSwitchHtml(checked, attrs = '') {
+  return `<label class="switch-row">
+    <span class="switch-text"><b>讓我的畫出現在推薦</b>
+      <span class="muted small">非好友也能看到我今天的畫與文字（只能看、不能留言），過了午夜就消失。可以隨時在「我的」關閉。</span></span>
+    <input type="checkbox" role="switch" name="sharePublic" ${attrs} ${checked ? 'checked' : ''}><span class="switch" aria-hidden="true"></span>
+  </label>`;
 }
 
 /** 兩個問題的欄位（註冊第二步、設定、忘記密碼共用） */
@@ -614,14 +660,17 @@ function mountPhotoInputs(host, onFiles) {
 }
 
 async function addAndShareNow(blobs, source, { onPending, onChange, alive = () => true, link = false } = {}) {
+  const me = state.me;
   onPending?.(blobs.length);
   await onChange?.();
   let failed = 0;
   let added = 0;
+  const newRecs = [];
   for (const b of blobs) {
     let rec = null;
     try {
       rec = await addDrawing(b, source);
+      newRecs.push(rec);
       added++;
     } catch (e) {
       toast(e.message || '這張圖片無法加入', 'error');
@@ -636,10 +685,53 @@ async function addAndShareNow(blobs, source, { onPending, onChange, alive = () =
     }
   }
   const action = link ? { action: { label: '查看', onClick: () => { location.hash = '#/today'; } } } : {};
+  const auto = added > 0 && getAutoSave(me.id);
+  const iosPrompt = auto && isIOS(); // iPhone 不能自動存進「照片」：改成提示一下，點了就開分享表
   if (failed) toast(link ? '有圖片還沒同步到雲端，可到「日曆」點「重試」' : '有圖片還沒同步到雲端，稍後可點「重試」', 'error', action);
-  else if (added && alive()) toast(source === 'sketch' ? '放進今天了！' : '已加入今天', '', action);
+  else if (added && alive() && !iosPrompt) toast(source === 'sketch' ? '放進今天了！' : '已加入今天', '', action);
+  if (added) {
+    requestPersistOnce(); // 第一張畫之後，請瀏覽器「不要自動清除」這個網站的資料
+    if (auto) autoSaveToPhone(newRecs).catch((e) => console.warn('auto save failed', e));
+  }
   return { added, failed };
 }
+
+// ════════════════════════════════════════════════════════════════
+//  存到手機相簿
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * 把畫存到相簿。items = [{ blob, day, n }]（n = 那天的第幾張，用來取檔名）。
+ * 必須在點擊事件裡直接呼叫：到 saveToAlbum 之前沒有任何 await，分享表才拿得到點擊的啟動狀態。
+ */
+function saveDrawingsToAlbum(items) {
+  const files = items.map((i) => toFile(i.blob, albumName(i.day, i.n, i.blob.type || 'image/jpeg')));
+  return saveToAlbum(files).then((result) => {
+    const msg = savedMessage(result, files.length);
+    if (msg) toast(msg);
+    return result;
+  });
+}
+
+/** 「自動存到手機」：新增畫之後 Android／電腦直接下載；iPhone／iPad 提示「存到相簿」，點一下開分享表 */
+async function autoSaveToPhone(recs) {
+  const day = recs[0].day;
+  const list = await archive.drawingsOfDay(state.me.id, day);
+  const files = recs.map((r) => toFile(r.blob, albumName(r.day, Math.max(1, list.findIndex((x) => x.id === r.id) + 1), r.blob.type || 'image/jpeg')));
+  if (isIOS()) {
+    toast(files.length > 1 ? `已加入 ${files.length} 張` : '已加入今天', '', {
+      duration: 9000,
+      action: { label: '存到相簿', onClick: () => { saveToAlbum(files).then((r) => { const m = savedMessage(r, files.length); if (m) toast(m); }); } },
+    });
+    return;
+  }
+  await downloadFiles(files);
+  toast(isAndroid() ? '已自動存到手機（相簿的「Download」）' : '已自動下載到手機／電腦');
+}
+
+const recoCardKey = () => `artday.reco.card.${state.me?.id}`;
+const recoCardSeen = () => { try { return !!localStorage.getItem(recoCardKey()); } catch { return false; } };
+function markRecoCardSeen() { try { localStorage.setItem(recoCardKey(), '1'); } catch { /* 存不了就算了 */ } }
 
 async function removeDrawing(rec) {
   if (rec.day === dayKey() && rec.cloud === 'synced') {
@@ -819,6 +911,7 @@ async function mountToday(el, c, onData = () => {}) {
         ${d.cloud === 'pending'
           ? `<button class="badge ${s.cls}" data-retry="${d.id}">${icon(s.ico, 14)}<span>${s.text}</span></button>`
           : `<span class="badge ${s.cls}">${icon(s.ico, 14)}<span>${s.text}</span></span>`}
+        <button class="tile-save" data-save="${d.id}" aria-label="存到相簿">${icon('image', 17)}</button>
         <button class="tile-del" data-del="${d.id}" aria-label="刪除這張畫">${icon('trash', 17)}</button>
       </figure>`;
     }).join('')
@@ -844,9 +937,14 @@ async function mountToday(el, c, onData = () => {}) {
     else if (t.hasAttribute('data-sketch')) {
       const blob = await openSketchPad();
       if (blob) addAndShare([blob], 'sketch');
+    } else if (t.dataset.save) {
+      // 不能先 await：分享表要在點擊的當下開
+      const i = drawings.findIndex((x) => x.id === t.dataset.save);
+      if (i >= 0) saveDrawingsToAlbum([{ blob: drawings[i].blob, day: drawings[i].day, n: i + 1 }]);
     } else if (t.dataset.view) {
       const d = drawings.find((x) => x.id === t.dataset.view);
       if (!d) return;
+      const di = drawings.indexOf(d);
       openDrawingModal({
         title: `今天 ${formatTime(d.createdAt)}`,
         src: c.url(d.blob),
@@ -856,6 +954,7 @@ async function mountToday(el, c, onData = () => {}) {
         isOwner: true,
         actions: commentActions(true),
         onCount: (n) => { counts.set(d.id, n); setCmtBadge(grid, d.id, n); },
+        onSave: () => saveDrawingsToAlbum([{ blob: d.blob, day: d.day, n: di + 1 }]),
         onDownload: () => downloadBlob(d.blob, `art-day-${d.day}-${formatTime(d.createdAt).replace(':', '')}.jpg`),
       });
     } else if (t.dataset.retry) {
@@ -934,7 +1033,7 @@ async function viewFriends(el, c, sub) {
       <a href="#/friends" role="tab" class="${tab === 'feed' ? 'on' : ''}" aria-selected="${tab === 'feed'}">今日動態</a>
       <a href="#/friends/list" role="tab" class="${tab === 'list' ? 'on' : ''}" aria-selected="${tab === 'list'}">好友名單<span class="nav-badge inline" data-badge hidden></span></a>
     </div>
-    ${tab === 'feed' ? '<div id="mine-slot"></div>' : ''}
+    ${tab === 'feed' ? '<div id="mine-slot"></div><div id="reco-join-slot"></div>' : ''}
     <div id="friends-body"><div class="loading">${spinner}<span>載入中…</span></div></div>`;
   applyBadge();
   const body = $('#friends-body', el);
@@ -963,9 +1062,50 @@ async function viewFriends(el, c, sub) {
     }
     await paintFeed(body, c);
     loadedAt = Date.now();
+    if (c.alive) mountRecoJoinCard($('#reco-join-slot', el)); // 等確定「推薦」可用再問
   } else {
     await paintFriendList(body, c);
   }
+}
+
+/**
+ * 已經有帳號、但還沒決定要不要加入「推薦」的人（預設不公開）：首頁最上面問一次。
+ * 按任何一顆都不會再出現（記在這台裝置）；之後隨時可以在「我的」改。
+ */
+function mountRecoJoinCard(slot) {
+  const me = state.me;
+  if (!slot || me?.sharePublic !== false || state.recoOff || recoCardSeen()) return;
+  slot.innerHTML = `<section class="opt-card" aria-label="加入推薦">
+    <span class="opt-card-ico">${icon('sparkle', 22)}</span>
+    <div class="opt-card-text">
+      <b>想讓更多人看到你的畫嗎？</b>
+      <p class="muted small">加入「推薦」後，不是好友的人也能在首頁看到你<b>今天</b>的畫與文字（只能看、不能留言），過了午夜就消失。可以隨時在「我的」關閉。</p>
+    </div>
+    <div class="opt-card-actions">
+      <button type="button" class="btn btn-small btn-primary" data-reco-join>加入推薦</button>
+      <button type="button" class="btn btn-small btn-ghost" data-reco-later>先不要</button>
+    </div>
+  </section>`;
+  slot.addEventListener('click', async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.hasAttribute('data-reco-later')) {
+      markRecoCardSeen();
+      slot.innerHTML = '';
+    } else if (b.hasAttribute('data-reco-join')) {
+      setBusy(b, true);
+      try {
+        state.me = await state.backend.updateProfile({ sharePublic: true });
+        markRecoCardSeen();
+        slot.innerHTML = '';
+        toast('已加入推薦：非好友也能看到你今天的畫');
+      } catch (err) {
+        console.warn(err);
+        setBusy(b, false);
+        toast(err.message || '設定失敗', 'error');
+      }
+    }
+  });
 }
 
 /** 首頁右下角的液態玻璃「＋」：新增今天的畫（拍照、上傳圖片或隨手畫），做法和日曆頁的「今天」完全一樣。回傳 photo 控制（給「我的」卡片的捷徑用） */
@@ -1077,6 +1217,7 @@ function mountMine(slot, c) {
         }).join('')}
         ${Array.from({ length: processing }, () => '<div class="post-img post-loading" role="status" aria-label="處理中"></div>').join('')}
       </div>` : ''}
+      ${n && !processing ? `<div class="post-tools"><button type="button" class="btn btn-small btn-ghost" data-mine-save>${icon('image', 17)}<span>存到相簿${n > 1 ? `（${n} 張）` : ''}</span></button></div>` : ''}
       ${note.trim() ? `<p class="post-note">${esc(note)}</p>` : ''}
     </article>`;
   }
@@ -1103,9 +1244,12 @@ function mountMine(slot, c) {
     if (!b) return;
     if (b.hasAttribute('data-mine-take')) api.photo?.take();
     else if (b.hasAttribute('data-mine-pick')) api.photo?.pick();
-    else if (b.dataset.mineView) {
+    else if (b.hasAttribute('data-mine-save')) {
+      saveDrawingsToAlbum(drawings.map((d, i) => ({ blob: d.blob, day: d.day, n: i + 1 })));
+    } else if (b.dataset.mineView) {
       const d = drawings.find((x) => x.id === b.dataset.mineView);
       if (!d) return;
+      const di = drawings.indexOf(d);
       openDrawingModal({
         title: `${me.displayName} · 今天 ${formatTime(d.createdAt)}`,
         src: c.url(d.blob), // 用整個頁面的網址：重畫時不會被收掉
@@ -1115,6 +1259,7 @@ function mountMine(slot, c) {
         isOwner: true,
         actions: commentActions(true),
         onCount: (n) => { counts.set(d.id, n); setCmtBadge(slot, d.id, n); },
+        onSave: () => saveDrawingsToAlbum([{ blob: d.blob, day: d.day, n: di + 1 }]),
         onDownload: () => downloadBlob(d.blob, `art-day-${d.day}-${formatTime(d.createdAt).replace(':', '')}.jpg`),
       });
     }
@@ -1123,9 +1268,60 @@ function mountMine(slot, c) {
   return api;
 }
 
+// ── 推薦貼文（非好友、同意公開分享的人今天的畫）──
+const RECO_SHOW = 4;        // 首頁最多顯示幾位
+const RECO_AFTER = 3;       // 規則：放在好友的第 3 則貼文之後；好友貼文不到 3 則就放在最後；沒有好友時也會顯示
+const recoHiddenKey = () => `artday.reco.hidden.${state.me?.id}`;
+
+function recoHidden() {
+  try { return new Set(JSON.parse(localStorage.getItem(recoHiddenKey())) || []); } catch { return new Set(); }
+}
+function hideReco(id) {
+  try { localStorage.setItem(recoHiddenKey(), JSON.stringify([...recoHidden(), id].slice(-300))); } catch { /* 存不了就只在這次隱藏 */ }
+}
+
+/** 推薦貼文；資料庫還沒更新（沒有欄位或函式）或出錯時回傳 null，畫面就不顯示這一區 */
+async function loadRecommended() {
+  if (state.me?.sharePublic === null) return null; // 沒有 share_public 欄位 = 還沒執行新的 schema.sql
+  const hidden = recoHidden();
+  try {
+    const list = await state.backend.recommendedPosts(Math.min(20, RECO_SHOW + hidden.size + 2));
+    return list.filter((p) => !hidden.has(p.profile.id) && p.drawings.length).slice(0, RECO_SHOW);
+  } catch (e) {
+    console.warn('recommendedPosts unavailable', e);
+    // 資料庫還沒有這個函式（沒重新執行 schema.sql）：整個「推薦」功能先藏起來（開關、卡片都不顯示）
+    if (/PGRST20[25]|42883|42703|42P01|schema cache|does not exist/i.test(`${e?.code || ''} ${e?.message || ''}`)) state.recoOff = true;
+    return null;
+  }
+}
+
+function recoBlock(list) {
+  if (!list?.length) return '';
+  return `<section class="reco" aria-label="推薦貼文">
+    <div class="section-head"><h2>推薦貼文</h2><span class="muted small">來自同意公開分享的人</span></div>
+    ${list.map((p) => postCard(p, { reco: true })).join('')}
+  </section>`;
+}
+
+/** 加好友：回傳 sendFriendRequest 的結果，並把這位的所有「加好友」按鈕換成狀態 */
+async function addFriendFromReco(root, id) {
+  const r = await state.backend.sendFriendRequest(id);
+  const done = r === 'accepted' || r === 'already_friends';
+  for (const el of root.querySelectorAll(`[data-reco-actions="${CSS.escape(id)}"]`)) {
+    el.innerHTML = `<span class="tag">${done ? '已成為好友' : '已邀請'}</span>`;
+  }
+  toast(done ? '你們成為好友了！重新整理就能看到對方今天的畫' : '邀請已送出，等對方接受');
+  badgeAt = Date.now();
+  return r;
+}
+
 async function paintFeed(body, c) {
-  const posts = await state.backend.fetchFriendsToday();
+  const [posts, reco] = await Promise.all([state.backend.fetchFriendsToday(), loadRecommended()]);
   if (!c.alive) return;
+  const images = new Map(); // 畫 id → 資料（好友與推薦共用，點開大圖時查詢）
+  for (const p of reco || []) for (const d of p.drawings) images.set(d.id, { ...d, who: p.profile.displayName, reco: p });
+
+  let active = [];
   if (!posts.length) {
     body.innerHTML = `<div class="empty">
       <div class="empty-art">${icon('users', 34)}</div>
@@ -1133,40 +1329,76 @@ async function paintFeed(body, c) {
       <p class="muted">加好友之後，就能看到彼此今天畫了什麼。</p>
       <a class="btn btn-primary" href="#/friends/list">${icon('userPlus', 18)}<span>加好友</span></a>
     </div>
+    ${recoBlock(reco)}
     <div id="suggest-slot"></div>`;
-    body.onclick = onFeedSuggestClick;
-    await fillFeedSuggestions($('#suggest-slot', body), c);
-    return;
+  } else {
+    active = posts.filter((p) => p.drawings.length || p.note)
+      .sort((a, b) => (b.lastAt || '').localeCompare(a.lastAt || ''));
+    const idle = posts.filter((p) => !p.drawings.length && !p.note);
+    const recoHtml = recoBlock(reco);
+    body.innerHTML = `
+      ${active.length ? `${active.slice(0, RECO_AFTER).map((p) => postCard(p)).join('')}${recoHtml}${active.slice(RECO_AFTER).map((p) => postCard(p)).join('')}` : `<div class="empty compact">
+        <div class="empty-art">${icon('pen', 30)}</div>
+        <h2>好友們今天還沒動筆</h2>
+        <p class="muted">晚點再來看看吧，或者你先畫一張？</p>
+        <a class="btn" href="#/calendar">${icon('pen', 18)}<span>去畫今天的</span></a>
+      </div>${recoHtml}`}
+      ${idle.length ? `<div class="idle">
+        <h3>今天還沒動筆</h3>
+        <div class="idle-list">${idle.map((p) => `<span class="idle-person">${avatar(p.profile, 30)}<span>${esc(p.profile.displayName)}</span></span>`).join('')}</div>
+      </div>` : ''}
+      <div id="suggest-slot"></div>`;
   }
-  const active = posts.filter((p) => p.drawings.length || p.note)
-    .sort((a, b) => (b.lastAt || '').localeCompare(a.lastAt || ''));
-  const idle = posts.filter((p) => !p.drawings.length && !p.note);
-
-  body.innerHTML = `
-    ${active.length ? active.map(postCard).join('') : `<div class="empty compact">
-      <div class="empty-art">${icon('pen', 30)}</div>
-      <h2>好友們今天還沒動筆</h2>
-      <p class="muted">晚點再來看看吧，或者你先畫一張？</p>
-      <a class="btn" href="#/calendar">${icon('pen', 18)}<span>去畫今天的</span></a>
-    </div>`}
-    ${idle.length ? `<div class="idle">
-      <h3>今天還沒動筆</h3>
-      <div class="idle-list">${idle.map((p) => `<span class="idle-person">${avatar(p.profile, 30)}<span>${esc(p.profile.displayName)}</span></span>`).join('')}</div>
-    </div>` : ''}
-    <div id="suggest-slot"></div>`;
   fillFeedSuggestions($('#suggest-slot', body), c);
 
-  const images = new Map();
-  for (const p of active) for (const d of p.drawings) images.set(d.id, { ...d, who: p.profile.displayName });
+  const friendImages = new Map();
+  for (const p of active) {
+    for (const d of p.drawings) {
+      const v = { ...d, who: p.profile.displayName };
+      images.set(d.id, v);
+      friendImages.set(d.id, v);
+    }
+  }
 
-  body.onclick = (e) => {
+  body.onclick = async (e) => {
     if (onFeedSuggestClick(e)) return;
+    const btn = e.target.closest('button');
+    if (btn?.dataset.recoAdd) {
+      setBusy(btn, true);
+      try { await addFriendFromReco(body, btn.dataset.recoAdd); } catch (err) {
+        console.warn(err);
+        setBusy(btn, false);
+        toast(err.message || '發生錯誤', 'error');
+      }
+      return;
+    }
+    if (btn?.dataset.recoSkip) {
+      hideReco(btn.dataset.recoSkip);
+      const sec = btn.closest('.reco');
+      btn.closest('.post')?.remove();
+      if (sec && !$('.post', sec)) sec.remove();
+      toast('之後不會再推薦這位的貼文');
+      return;
+    }
     const b = e.target.closest('[data-cloud-view]');
     if (!b) return;
     const img = $('img', b);
     if (!img?.src) return;
     const id = b.dataset.cloudView;
     const d = images.get(id);
+    if (d?.reco) {
+      // 推薦貼文：只能看（沒有留言區），可以直接加好友
+      const rid = d.reco.profile.id;
+      openDrawingModal({
+        title: `${d.who} · 今天 ${formatTime(d.createdAt)}`,
+        src: img.src,
+        alt: `${d.who} 今天的畫`,
+        me: state.me,
+        isOwner: false,
+        onAddFriend: () => addFriendFromReco(body, rid),
+      });
+      return;
+    }
     openDrawingModal({
       title: `${d?.who || ''} · 今天 ${d ? formatTime(d.createdAt) : ''}`,
       src: img.src,
@@ -1179,11 +1411,11 @@ async function paintFeed(body, c) {
     });
   };
 
-  // 各張畫的留言數（不擋住圖片載入；留言功能還沒設定好時就安靜略過）
-  loadComments([...images.keys()]).then((list) => {
+  // 各張畫的留言數（只有好友的畫；不擋住圖片載入；留言功能還沒設定好時就安靜略過）
+  loadComments([...friendImages.keys()]).then((list) => {
     if (!c.alive || list.failed) return;
     const counts = countBy(list);
-    for (const id of images.keys()) setCmtBadge(body, id, counts.get(id) || 0, true);
+    for (const id of friendImages.keys()) setCmtBadge(body, id, counts.get(id) || 0, true);
   });
 
   // 逐張載入圖片（一次最多 3 張）
@@ -1203,23 +1435,29 @@ async function paintFeed(body, c) {
   await Promise.all([worker(), worker(), worker()]);
 }
 
-function postCard(p) {
+function postCard(p, { reco = false } = {}) {
   const n = p.drawings.length;
-  const meta = [n ? `${n} 張畫` : '寫了一段話', p.lastAt ? formatTime(p.lastAt) : ''].filter(Boolean).join(' · ');
+  const reason = reco && p.mutualCount > 0 ? `${p.mutualCount} 位共同好友` : '';
+  const meta = [n ? `${n} 張畫` : '寫了一段話', p.lastAt ? formatTime(p.lastAt) : '', reason].filter(Boolean).join(' · ');
   const single = n === 1 ? p.drawings[0] : null;
-  return `<article class="post">
+  const id = p.profile.id;
+  return `<article class="post ${reco ? 'post-reco' : ''}">
     <header class="post-head">
       ${avatar(p.profile, 42)}
-      <div class="post-who"><b>${esc(p.profile.displayName)}</b><span class="muted small">@${esc(p.profile.username)} · ${meta}</span></div>
+      <div class="post-who"><b>${esc(p.profile.displayName)}${reco ? '<span class="reco-tag">推薦</span>' : ''}</b><span class="muted small">@${esc(p.profile.username)} · ${esc(meta)}</span></div>
     </header>
     ${n ? `<div class="post-grid ${single ? 'single' : ''}">
-      ${p.drawings.map((d) => `<button class="post-img" data-cloud-view="${esc(d.id)}" aria-label="查看大圖與留言"
+      ${p.drawings.map((d) => `<button class="post-img" data-cloud-view="${esc(d.id)}" aria-label="${reco ? '查看大圖' : '查看大圖與留言'}"
           ${single && d.width && d.height ? `style="aspect-ratio:${d.width}/${d.height}"` : ''}>
           <img data-cloud-id="${esc(d.id)}" alt="${esc(p.profile.displayName)} 今天的畫">
-          ${cmtBadge(d.id, 0, true)}
+          ${reco ? '' : cmtBadge(d.id, 0, true)}
         </button>`).join('')}
     </div>` : ''}
     ${p.note ? `<p class="post-note">${esc(p.note)}</p>` : ''}
+    ${reco ? `<div class="post-actions" data-reco-actions="${esc(id)}">
+      <button class="btn btn-small btn-primary" data-reco-add="${esc(id)}">${icon('userPlus', 16)}<span>加好友</span></button>
+      <button class="btn btn-small btn-ghost" data-reco-skip="${esc(id)}">不感興趣</button>
+    </div>` : ''}
   </article>`;
 }
 
@@ -1628,6 +1866,7 @@ function mountPastDay(el, c, day, list, note, { onBack, onData }) {
         <figcaption>
           <span class="muted small">${formatTime(d.createdAt)}${d.source === 'sketch' ? ' · 隨手畫' : ''}</span>
           <span class="sheet-actions">
+            <button class="icon-btn small" data-save="${i}" aria-label="存到相簿" title="存到相簿">${icon('image', 18)}</button>
             <button class="icon-btn small" data-dl="${i}" aria-label="下載">${icon('download', 18)}</button>
             <button class="icon-btn small" data-rm="${i}" aria-label="刪除">${icon('trash', 18)}</button>
           </span>
@@ -1655,10 +1894,11 @@ function mountPastDay(el, c, day, list, note, { onBack, onData }) {
     const b = e.target.closest('button');
     if (!b || !c.alive) return;
     if (b.hasAttribute('data-back')) { onBack(); return; }
-    const i = Number(b.dataset.open ?? b.dataset.dl ?? b.dataset.rm);
+    const i = Number(b.dataset.open ?? b.dataset.dl ?? b.dataset.rm ?? b.dataset.save);
     const d = list[i];
     if (!d) return;
     const fname = `art-day-${day}-${i + 1}.jpg`;
+    if (b.dataset.save !== undefined) { saveDrawingsToAlbum([{ blob: d.blob, day, n: i + 1 }]); return; }
     if (b.dataset.open !== undefined) {
       openDrawingModal({
         title: `${formatDayLong(day)} ${formatTime(d.createdAt)}`,
@@ -1669,6 +1909,7 @@ function mountPastDay(el, c, day, list, note, { onBack, onData }) {
         isOwner: true,
         readOnly: true,
         actions: commentActions(true),
+        onSave: () => saveDrawingsToAlbum([{ blob: d.blob, day, n: i + 1 }]),
         onDownload: () => downloadBlob(d.blob, fname),
       });
     } else if (b.dataset.dl !== undefined) {
@@ -1695,6 +1936,102 @@ function formatBytes(n) {
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }
 
+const monthLabel = (m) => `${m.slice(0, 4)} 年 ${Number(m.slice(5))} 月`;
+
+/** 「安裝到主畫面」那一列右邊的內容：依裝置與瀏覽器給不同的做法 */
+function installHtml() {
+  if (isStandalone()) return `<b class="ok-text">${icon('shield', 16)} 已安裝</b>`;
+  if (installEvent) return `<button class="btn btn-small" data-install>${icon('mobileSave', 16)}<span>安裝</span></button>`;
+  if (isIOS()) return `<button class="btn btn-small" data-install-help>${icon('mobileSave', 16)}<span>怎麼安裝</span></button>`;
+  return '<span class="muted small install-hint">用瀏覽器選單的「安裝」或「加入主畫面」</span>';
+}
+
+function showInstallHelp() {
+  openModal({
+    title: '安裝到主畫面',
+    className: 'modal-small',
+    content: `<ol class="steps">
+        <li>用 <b>Safari</b> 打開這個網站，點畫面下方（或右上角）的 <b>分享</b> 按鈕。</li>
+        <li>往下找到 <b>加入主畫面</b>，點下去。</li>
+        <li>按右上角的 <b>新增</b>。之後就像 App 一樣，從主畫面打開。</li>
+      </ol>
+      <p class="muted small">安裝後，iPhone 比較不會清掉你的畫。記得也要用「存到相簿」另外留一份。</p>
+      <div class="modal-foot"><button class="btn btn-primary" data-close>知道了</button></div>`,
+  });
+}
+
+/**
+ * 「全部存到相簿」：依序存一批一批。手機上用分享表（每批最多 10 張、每批要點一下，這是瀏覽器的規定）；
+ * 電腦或不能分享檔案的瀏覽器，一次下載全部。
+ */
+const ALBUM_BATCH = 10;
+function openAlbumSaver(items) {
+  const total = items.length;
+  const makeFiles = (list) => list.map((i) => toFile(i.blob, albumName(i.day, i.n, i.blob.type || 'image/jpeg')));
+  const shareMode = isMobileDevice() && canShareFiles(makeFiles(items.slice(0, 1)));
+  const batches = Math.ceil(total / ALBUM_BATCH);
+  let done = 0;
+  let batch = 0;
+  let running = false;
+
+  const m = openModal({
+    title: '全部存到相簿',
+    className: 'modal-small',
+    content: `<div class="stack album-saver">
+      <p class="album-count"><b data-done>0</b> / ${total} 張</p>
+      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="0"><i data-bar></i></div>
+      <p class="muted small" data-hint></p>
+      <div class="modal-foot"><button class="btn" data-close>關閉</button><button class="btn btn-primary" data-go></button></div>
+    </div>`,
+  });
+  const go = $('[data-go]', m.body);
+  const bar = $('[data-bar]', m.body);
+  const hint = $('[data-hint]', m.body);
+  const paint = () => {
+    $('[data-done]', m.body).textContent = String(done);
+    bar.style.width = `${(done / total) * 100}%`;
+    $('.progress', m.body).setAttribute('aria-valuenow', String(done));
+    if (done >= total) {
+      go.innerHTML = '<span>完成</span>';
+      hint.textContent = shareMode ? '每一批在分享表選「儲存影像」（iPhone）或「相簿」（Android）。' : '已全部下載。';
+    } else if (shareMode) {
+      const n = Math.min(ALBUM_BATCH, total - done);
+      go.innerHTML = `<span>${batch === 0 ? '開始' : '下一批'}：存 ${n} 張</span>`;
+      hint.textContent = `第 ${batch + 1} / ${batches} 批。點按鈕會開啟分享表，iPhone 選「儲存影像」，Android 選「相簿」或「照片」。`;
+    } else {
+      go.innerHTML = `<span>下載全部 ${total} 張</span>`;
+      hint.textContent = '會一張一張下載到「下載」資料夾（瀏覽器可能會問你是否允許下載多個檔案）。';
+    }
+  };
+  paint();
+
+  go.addEventListener('click', () => {
+    if (running) return;
+    if (done >= total) { m.close(true); return; }
+    if (shareMode) {
+      // 直接在點擊裡開分享表（前面沒有 await）
+      const list = items.slice(done, done + ALBUM_BATCH);
+      running = true;
+      go.disabled = true;
+      saveToAlbum(makeFiles(list)).then((r) => {
+        if (r !== 'cancelled') { done += list.length; batch++; }
+        running = false;
+        go.disabled = false;
+        paint();
+      });
+    } else {
+      running = true;
+      go.disabled = true;
+      downloadFiles(makeFiles(items), (n) => { done = n; paint(); }).then(() => {
+        running = false;
+        go.disabled = false;
+        paint();
+        toast(`已下載 ${total} 張`);
+      });
+    }
+  });
+}
+
 async function viewMe(el, c) {
   const me = state.me;
   const [act, est, persisted, recovery] = await Promise.all([
@@ -1706,6 +2043,7 @@ async function viewMe(el, c) {
   if (!c.alive) return;
   const streak = streakOf(act.drawingDays, state.today);
   const link = inviteLink(me.username);
+  const autoOn = getAutoSave(me.id);
 
   el.innerHTML = `
     <section class="card profile-card">
@@ -1739,6 +2077,14 @@ async function viewMe(el, c) {
       </div>
     </section>
 
+    ${typeof me.sharePublic === 'boolean' && !state.recoOff ? `<section class="section">
+      <h2>推薦</h2>
+      <div class="card stack">
+        ${shareSwitchHtml(me.sharePublic, 'data-share-public')}
+        <p class="field-hint">只有「今天」的畫與文字會被看到，過了午夜就消失；對方只能看，不能留言。關閉後，不是好友的人就看不到你的畫了。</p>
+      </div>
+    </section>` : ''}
+
     ${recovery.supported ? `<section class="section" data-recovery>
       <h2>忘記密碼的問題</h2>
       <div class="card stack">
@@ -1754,6 +2100,31 @@ async function viewMe(el, c) {
     </section>` : ''}
 
     <section class="section">
+      <h2>存到手機</h2>
+      <div class="card stack">
+        <p>瀏覽器的儲存空間不算牢靠，建議把畫也存進<b>手機的相簿</b>。</p>
+        <label class="switch-row">
+          <span class="switch-text"><b>自動存到手機</b><span class="muted small">每次新增畫之後，自動存一份完整畫質的 JPEG</span></span>
+          <input type="checkbox" role="switch" data-auto-save ${autoOn ? 'checked' : ''}><span class="switch" aria-hidden="true"></span>
+        </label>
+        <p class="field-hint">${isIOS()
+    ? 'iPhone／iPad 不允許網站在背景直接存進「照片」，所以新增後會跳出「存到相簿」，點一下，在分享表選「儲存影像」就好。'
+    : isAndroid()
+      ? 'Android：新增後會自動下載一份（第一次瀏覽器可能會問你是否「允許」自動下載），相簿通常看得到「Download」資料夾。'
+      : '電腦：新增後會自動下載到「下載」資料夾。手機上才會有「存到相簿」的分享表。'}</p>
+        <div class="album-all">
+          <label class="field"><span class="field-label">存到相簿的範圍</span>
+            <select data-album-range>
+              <option value="all">全部（${act.drawingCount} 張）</option>
+              ${[...new Set([...act.drawingDays].map((d) => d.slice(0, 7)))].sort().reverse().map((m) => `<option value="${m}">${monthLabel(m)}</option>`).join('')}
+            </select></label>
+          <button class="btn" data-album-all ${act.drawingCount ? '' : 'disabled'}>${icon('image', 18)}<span>全部存到相簿</span></button>
+        </div>
+        <p class="field-hint">手機上每批最多 10 張，每一批都要點一下（這是瀏覽器的規定）。每張畫也都有自己的「存到相簿」按鈕。</p>
+      </div>
+    </section>
+
+    <section class="section">
       <h2>本機保存</h2>
       <div class="card stack">
         <p>你所有的畫都保存在<b>這台裝置的瀏覽器</b>裡。清除瀏覽器資料或換手機前，記得先匯出備份。</p>
@@ -1761,6 +2132,8 @@ async function viewMe(el, c) {
         <div class="kv"><span>防止瀏覽器自動清除</span>
           ${persisted ? `<b class="ok-text">${icon('shield', 16)} 已開啟</b>` : `<button class="btn btn-small" data-persist>${icon('shield', 16)}<span>開啟保護</span></button>`}
         </div>
+        <div class="kv"><span>安裝到主畫面</span><span data-install-slot>${installHtml()}</span></div>
+        <p class="field-hint save-note">iPhone／iPad 的 Safari 會在一段時間沒使用後，清掉「沒有加入主畫面」的網站資料。建議<b>安裝到主畫面</b>，並用「存到相簿」另外留一份。</p>
         <div class="btn-row">
           <button class="btn" data-export>${icon('download', 18)}<span>匯出備份</span></button>
           <button class="btn" data-import>${icon('upload', 18)}<span>匯入備份</span></button>
@@ -1784,6 +2157,32 @@ async function viewMe(el, c) {
 
   const importInput = $('#import-input', el);
   const avatarInput = $('#avatar-input', el);
+
+  // 安裝按鈕：beforeinstallprompt 可能在頁面打開之後才來，來了就更新
+  const installSlot = $('[data-install-slot]', el);
+  const refreshInstall = () => { if (c.alive && installSlot.isConnected) installSlot.innerHTML = installHtml(); };
+  installWatchers.add(refreshInstall);
+  c.onDispose(() => installWatchers.delete(refreshInstall));
+
+  el.addEventListener('change', async (e) => {
+    const t = e.target;
+    if (t.matches('[data-auto-save]')) {
+      setAutoSave(me.id, t.checked);
+      toast(t.checked ? (isIOS() ? '已開啟：新增畫之後會提示你存到相簿' : '已開啟：新增畫之後會自動存到手機') : '已關閉自動存到手機');
+    } else if (t.matches('[data-share-public]')) {
+      t.disabled = true;
+      try {
+        state.me = await state.backend.updateProfile({ sharePublic: t.checked });
+        markRecoCardSeen();
+        toast(t.checked ? '已加入推薦：非好友也能看到你今天的畫' : '已關閉推薦');
+      } catch (err) {
+        console.warn(err);
+        t.checked = !t.checked; // 沒存成功：開關退回去
+        toast(err.message || '設定失敗', 'error');
+      }
+      t.disabled = false;
+    }
+  });
 
   avatarInput.addEventListener('change', async () => {
     const file = avatarInput.files[0];
@@ -1822,6 +2221,36 @@ async function viewMe(el, c) {
         toast('已移除');
         render();
       } catch (err) { toast(err.message || '移除失敗', 'error'); }
+    } else if (b.hasAttribute('data-install')) {
+      const ev = installEvent;
+      if (!ev) return;
+      installEvent = null; // 一個事件只能用一次
+      try {
+        await ev.prompt();
+        const choice = await ev.userChoice;
+        if (choice?.outcome === 'accepted') toast('已安裝，可以從主畫面打開');
+      } catch (err) { console.warn(err); }
+      refreshInstall();
+    } else if (b.hasAttribute('data-install-help')) {
+      showInstallHelp();
+    } else if (b.hasAttribute('data-album-all')) {
+      const range = $('[data-album-range]', el).value;
+      setBusy(b, true, '準備中…');
+      try {
+        const from = range === 'all' ? '0000-00-00' : `${range}-01`;
+        const to = range === 'all' ? '9999-99-99' : `${range}-31`;
+        const list = (await archive.drawingsInRange(me.id, from, to))
+          .sort((x, y) => x.day.localeCompare(y.day) || x.createdAt - y.createdAt);
+        const perDay = new Map();
+        const items = list.map((d) => {
+          const n = (perDay.get(d.day) || 0) + 1;
+          perDay.set(d.day, n);
+          return { blob: d.blob, day: d.day, n };
+        });
+        setBusy(b, false);
+        if (!items.length) toast('這個範圍沒有畫');
+        else openAlbumSaver(items);
+      } catch (err) { setBusy(b, false); toast(err.message || '讀取失敗', 'error'); }
     } else if (b.hasAttribute('data-persist')) {
       const ok = await navigator.storage?.persist?.().catch(() => false);
       toast(ok ? '已開啟保護，瀏覽器不會自動清除你的畫' : '瀏覽器沒有同意。把網站加到主畫面，或常常使用，通常就會允許', ok ? '' : 'error');

@@ -30,6 +30,8 @@ export function commentHtml(c, { canDelete = false, compact = false } = {}) {
  * @param {object} o.actions      { load(id) -> comments[], add(id, body) -> comment, remove(comment) }
  * @param {boolean} [o.readOnly] 只能看留言（過期的畫：不能新增或刪除）
  * @param {Function} [o.onDownload]
+ * @param {Function} [o.onSave]   「存到相簿」：會在點擊當下同步呼叫（不要 await 之後才開分享表）
+ * @param {Function} [o.onAddFriend] 推薦貼文用：「加好友」，回傳 Promise<'accepted'|'already_friends'|其他>
  * @param {Function} [o.onCount]  留言數改變時 (n) => void
  * @param {Function} [o.onClose]
  */
@@ -43,7 +45,11 @@ export function openDrawingModal(o) {
       <div class="drawing-detail">
         <div class="drawing-scroll">
           <figure class="drawing-fig"><img src="${esc(o.src)}" alt="${esc(o.alt || '畫作')}"></figure>
-          ${o.onDownload ? `<div class="drawing-tools"><button class="btn btn-small" data-download>${icon('download', 18)}<span>下載</span></button></div>` : ''}
+          ${o.onSave || o.onDownload || o.onAddFriend ? `<div class="drawing-tools">
+            ${o.onAddFriend ? `<span class="drawing-friend" data-friend><button class="btn btn-small btn-primary" data-addfriend>${icon('userPlus', 18)}<span>加好友</span></button></span>` : ''}
+            ${o.onSave ? `<button class="btn btn-small" data-save>${icon('image', 18)}<span>存到相簿</span></button>` : ''}
+            ${o.onDownload ? `<button class="btn btn-small" data-download>${icon('download', 18)}<span>下載</span></button>` : ''}
+          </div>` : ''}
           ${hasComments ? `<section class="comments" aria-label="留言">
             <h4 class="comments-title">留言 <span class="muted" data-count></span></h4>
             <ul class="comment-list" aria-live="polite"><li class="loading">${'<span class="spinner" aria-hidden="true"></span>'}<span>載入中…</span></li></ul>
@@ -57,6 +63,21 @@ export function openDrawingModal(o) {
       </div>`,
   });
   m.body.querySelector('[data-download]')?.addEventListener('click', o.onDownload);
+  // 直接呼叫（不包 async／await），分享表才拿得到點擊的啟動狀態
+  m.body.querySelector('[data-save]')?.addEventListener('click', () => o.onSave());
+  const addBtn = m.body.querySelector('[data-addfriend]');
+  addBtn?.addEventListener('click', async () => {
+    setBusy(addBtn, true);
+    try {
+      const r = await o.onAddFriend();
+      const done = r === 'accepted' || r === 'already_friends';
+      m.body.querySelector('[data-friend]').innerHTML = `<span class="tag">${done ? '已成為好友' : '已邀請'}</span>`;
+    } catch (err) {
+      console.warn(err);
+      setBusy(addBtn, false);
+      toast(err.message || '發生錯誤', 'error');
+    }
+  });
   if (!hasComments) return m;
 
   const list = m.body.querySelector('.comment-list');
