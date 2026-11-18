@@ -28,6 +28,7 @@ export function commentHtml(c, { canDelete = false, compact = false } = {}) {
  * @param {object} o.me           目前使用者
  * @param {boolean} o.isOwner     這是不是我的畫（我可以刪除上面的任何留言）
  * @param {object} o.actions      { load(id) -> comments[], add(id, body) -> comment, remove(comment) }
+ * @param {boolean} [o.readOnly] 只能看留言（過期的畫：不能新增或刪除）
  * @param {Function} [o.onDownload]
  * @param {Function} [o.onCount]  留言數改變時 (n) => void
  * @param {Function} [o.onClose]
@@ -48,7 +49,7 @@ export function openDrawingModal(o) {
             <ul class="comment-list" aria-live="polite"><li class="loading">${'<span class="spinner" aria-hidden="true"></span>'}<span>載入中…</span></li></ul>
           </section>` : ''}
         </div>
-        ${hasComments ? `<form class="comment-form" autocomplete="off">
+        ${hasComments && !o.readOnly ? `<form class="comment-form" autocomplete="off">
           <input name="body" maxlength="${COMMENT_MAX}" placeholder="說點什麼…" aria-label="留言內容" enterkeyhint="send">
           <span class="comment-left" data-left hidden></span>
           <button class="btn btn-primary btn-small" type="submit" aria-label="送出留言" disabled>${icon('send', 18)}<span>送出</span></button>
@@ -62,13 +63,13 @@ export function openDrawingModal(o) {
   const scroller = m.body.querySelector('.drawing-scroll');
   const countEl = m.body.querySelector('[data-count]');
   const form = m.body.querySelector('.comment-form');
-  const input = form.elements.body;
-  const sendBtn = form.querySelector('button[type="submit"]');
+  const input = form?.elements.body;
+  const sendBtn = form?.querySelector('button[type="submit"]');
   const leftEl = m.body.querySelector('[data-left]');
   let comments = [];
   let loadFailed = false;
 
-  const canDelete = (c) => o.isOwner || c.author.id === o.me.id;
+  const canDelete = (c) => !o.readOnly && (o.isOwner || c.author.id === o.me.id);
 
   function paint(scrollToEnd = false) {
     countEl.textContent = comments.length ? String(comments.length) : '';
@@ -79,13 +80,14 @@ export function openDrawingModal(o) {
   }
 
   const refreshSend = () => {
+    if (!form) return;
     const n = [...input.value.trim()].length;
     sendBtn.disabled = !n;
     const left = COMMENT_MAX - input.value.length;
     leftEl.hidden = left > 40;
     leftEl.textContent = String(left);
   };
-  input.addEventListener('input', refreshSend);
+  input?.addEventListener('input', refreshSend);
 
   o.actions.load(o.drawingId).then((list2) => {
     comments = list2;
@@ -94,7 +96,7 @@ export function openDrawingModal(o) {
     o.onCount?.(comments.length);
   }).catch((e) => { console.warn(e); loadFailed = true; paint(); });
 
-  form.addEventListener('submit', async (e) => {
+  form?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const body = input.value.trim();
     if (!body) return;
@@ -131,6 +133,6 @@ export function openDrawingModal(o) {
     }
   });
 
-  refreshSend();
+  if (form) refreshSend();
   return m;
 }

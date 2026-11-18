@@ -6,7 +6,7 @@ import * as archive from './archive.js';
 import { processImage, cloudCopy, makeThumb, dataURLToBlob, makeAvatar } from './imaging.js';
 import { icon } from './icons.js';
 import { dayKey, addDays, endOfDay, dayParts, formatDayLong, timeLeftToday, formatTime } from './dates.js';
-import { esc, toast, openModal, confirmDialog, lightbox, avatar, uuid, debounce, copyText, downloadBlob, setBusy } from './ui.js';
+import { esc, toast, openModal, confirmDialog, avatar, uuid, debounce, copyText, downloadBlob, setBusy } from './ui.js';
 import { openSketchPad } from './sketch.js';
 import { ANIMALS, checkRecoveryInput, SCHOOL_MAX, MSG as RECOVERY_MSG } from './recovery.js';
 import { openDrawingModal, commentHtml } from './drawing-modal.js';
@@ -20,6 +20,7 @@ const state = {
   me: null,
   today: dayKey(),
   calMonth: null,
+  selDay: null, // 日曆下方顯示哪一天；null = 今天
   incoming: 0,
   maintainedDay: null,
 };
@@ -35,6 +36,11 @@ const spinner = '<span class="spinner" aria-hidden="true"></span>';
 let ctx = null;
 function newCtx() {
   ctx?.dispose();
+  ctx = makeCtx();
+  return ctx;
+}
+
+function makeCtx() {
   const urls = [];
   const timers = [];
   const cleanups = [];
@@ -51,8 +57,14 @@ function newCtx() {
       setTimeout(() => urls.forEach((u) => URL.revokeObjectURL(u)), 1000);
     },
   };
-  ctx = c;
   return c;
+}
+
+/** 頁面裡可以單獨換掉的一塊（例如選了別天）：自己的網址與計時器，頁面離開時一起釋放 */
+function subCtx(parent) {
+  const k = makeCtx();
+  parent.onDispose(() => k.dispose());
+  return k;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -98,9 +110,11 @@ function checkDayChange() {
   const t = dayKey();
   if (t === state.today) return;
   state.today = t;
+  state.selDay = null;
+  state.calMonth = null;
   if (!state.me) return;
   const name = parseRoute().name || 'friends';
-  if (name === 'today' || name === 'friends' || name === 'calendar') render();
+  if (name === 'friends' || name === 'calendar') render();
   else dailyMaintenance();
 }
 
@@ -123,7 +137,7 @@ async function dailyMaintenance() {
 //  路由
 // ════════════════════════════════════════════════════════════════
 
-const VIEWS = { friends: viewFriends, today: viewToday, calendar: viewCalendar, me: viewMe };
+const VIEWS = { friends: viewFriends, calendar: viewCalendar, me: viewMe };
 const HOME = 'friends'; // 首頁 = 好友動態
 
 function parseRoute() {
@@ -135,7 +149,14 @@ function parseRoute() {
 
 let lastRoute = '';
 async function render() {
-  const route = parseRoute();
+  let route = parseRoute();
+  if (route.name === 'today') {
+    // 舊的「今天」網址：導到合併後的日曆頁，並選回今天
+    state.selDay = null;
+    state.calMonth = null;
+    history.replaceState(null, '', `${location.pathname}${location.search}#/calendar`);
+    route = parseRoute();
+  }
   if (route.name === 'add' && route.arg) {
     sessionStorage.setItem('artday.invite', route.arg);
     location.replace('#/friends/list');
@@ -199,7 +220,6 @@ function renderShell(active) {
         <a class="brand" href="#/friends">${brandMark()}<span class="brand-name">Art Day</span><span class="brand-sub">藝術小日曆</span></a>
         <nav class="nav" aria-label="主選單">
           ${navItem('friends', '好友', 'users', active)}
-          ${navItem('today', '今天', 'sun', active)}
           ${navItem('calendar', '日曆', 'calendar', active)}
           ${navItem('me', '我的', 'user', active)}
         </nav>
@@ -502,7 +522,7 @@ function openForgotPassword(prefill = '') {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  今天
+//  今天（日曆頁下方的當天內容）
 // ════════════════════════════════════════════════════════════════
 
 async function addDrawing(blob, source) {
@@ -547,7 +567,7 @@ async function pushDrawing(rec) {
  *   onPending(n)  處理中的張數變化（開始時 +n，每張處理完 -1）
  *   onChange()    本機資料有變動，畫面可以重畫
  *   alive()       呼叫的畫面還在不在（不在就不顯示成功提示）
- *   link          成功提示附上「查看」連結，點了到「今天」
+ *   link          成功提示附上「查看」連結，點了到「日曆」頁（今天）
  */
 let addChain = Promise.resolve();
 function addAndShareToday(blobs, source, opts = {}) {
@@ -580,7 +600,7 @@ async function addAndShareNow(blobs, source, { onPending, onChange, alive = () =
     }
   }
   const action = link ? { action: { label: '查看', onClick: () => { location.hash = '#/today'; } } } : {};
-  if (failed) toast(link ? '有圖片還沒同步到雲端，可到「今天」點「重試」' : '有圖片還沒同步到雲端，稍後可點「重試」', 'error', action);
+  if (failed) toast(link ? '有圖片還沒同步到雲端，可到「日曆」點「重試」' : '有圖片還沒同步到雲端，稍後可點「重試」', 'error', action);
   else if (added && alive()) toast(source === 'sketch' ? '放進今天了！' : '已加入今天', '', action);
   return { added, failed };
 }
@@ -684,31 +704,24 @@ const STATUS = {
   local: { cls: '', ico: 'device', text: '僅本機' },
 };
 
-async function viewToday(el, c) {
+async function mountToday(el, c, onData = () => {}) {
   const me = state.me;
   const day = state.today;
   const p = dayParts(day);
   let processing = 0;
 
   el.innerHTML = `
-    <section class="hero">
-      <div class="cal-page" aria-hidden="true">
-        <div class="cal-rings"><i></i><i></i></div>
-        <div class="cal-top">${p.monthEn} · ${p.year}</div>
-        <div class="cal-num">${p.date}</div>
-        <div class="cal-week">${p.weekday}</div>
+    <section class="day-head">
+      <div class="day-head-text">
+        <p class="eyebrow">${p.year} 年 ${p.month} 月 ${p.date} 日 · ${p.weekday}</p>
+        <h2 id="today-title">今天畫了什麼？</h2>
       </div>
-      <div class="hero-text">
-        <p class="eyebrow">${p.year} 年 ${p.month} 月 ${p.date} 日</p>
-        <h1 id="today-title">今天畫了什麼？</h1>
-        <p class="muted">今天的畫會分享給好友，明天就從雲端移除，只留在你的裝置裡。</p>
-        <p class="chip" id="cloud-chip">${icon('clock', 16)}<span></span></p>
-      </div>
+      <p class="chip" id="cloud-chip">${icon('clock', 16)}<span></span></p>
     </section>
 
     <section class="section drop-zone" id="drop-zone">
       <div class="section-head">
-        <h2>今天的畫</h2>
+        <h3>今天的畫</h3>
         <span class="muted small" id="today-count"></span>
       </div>
       <div class="grid" id="today-grid"></div>
@@ -718,7 +731,7 @@ async function viewToday(el, c) {
 
     <section class="section">
       <div class="section-head">
-        <h2>今日記錄</h2>
+        <h3>今日記錄</h3>
         <span class="muted small" id="note-state" aria-live="polite"></span>
       </div>
       <div class="note-card">
@@ -741,6 +754,7 @@ async function viewToday(el, c) {
 
   let drawings = [];
   let counts = new Map();
+  let lastSig = null;
 
   /** 好友留在我今天的畫上的留言數 */
   async function refreshCounts() {
@@ -755,6 +769,9 @@ async function viewToday(el, c) {
   async function paintGrid() {
     drawings = await archive.drawingsOfDay(me.id, day);
     if (!c.alive) return;
+    const sig = drawings.map((d) => d.id).join();
+    if (lastSig !== null && sig !== lastSig) onData();
+    lastSig = sig;
     const shared = drawings.filter((d) => d.cloud === 'synced').length;
     $('#today-title', el).textContent = drawings.length ? `今天畫了 ${drawings.length} 張` : '今天畫了什麼？';
     $('#today-count', el).textContent = drawings.length ? `已分享 ${shared} 張 · 雲端上限 ${CLOUD_MAX} 張` : '';
@@ -847,6 +864,7 @@ async function viewToday(el, c) {
     const text = noteEl.value;
     await archive.putNote(me.id, day, text);
     if (c.alive) noteState.textContent = '已存在本機…';
+    onData();
     try {
       if (day === dayKey()) await state.backend.saveNote({ day, note: text, expiresAt: endOfDay(day).toISOString() });
       if (c.alive) noteState.textContent = text.trim() ? '已儲存 · 好友今天看得到' : '已儲存';
@@ -909,7 +927,7 @@ async function viewFriends(el, c, sub) {
   }
 }
 
-/** 首頁右下角的液態玻璃「＋」：新增今天的畫（上傳圖片或隨手畫），做法和「今天」頁完全一樣 */
+/** 首頁右下角的液態玻璃「＋」：新增今天的畫（上傳圖片或隨手畫），做法和日曆頁的「今天」完全一樣 */
 function mountAddButton(el, c) {
   el.classList.add('has-fab');
   el.insertAdjacentHTML('beforeend', `
@@ -979,7 +997,7 @@ async function paintFeed(body, c) {
       <div class="empty-art">${icon('pen', 30)}</div>
       <h2>好友們今天還沒動筆</h2>
       <p class="muted">晚點再來看看吧，或者你先畫一張？</p>
-      <a class="btn" href="#/today">${icon('pen', 18)}<span>去畫今天的</span></a>
+      <a class="btn" href="#/calendar">${icon('pen', 18)}<span>去畫今天的</span></a>
     </div>`}
     ${idle.length ? `<div class="idle">
       <h3>今天還沒動筆</h3>
@@ -1314,127 +1332,164 @@ function streakOf(days, today) {
   return n;
 }
 
+const monthKey = (dt) => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+
+/** 日曆頁：上面是壓扁的月曆，下面是選到那天的內容（預設今天，隨頁面往下捲） */
 async function viewCalendar(el, c) {
   const me = state.me;
   const today = state.today;
   const thisMonth = today.slice(0, 7);
-  const month = state.calMonth && state.calMonth <= thisMonth ? state.calMonth : thisMonth;
-  const [y, m] = month.split('-').map(Number);
-  const daysIn = new Date(y, m, 0).getDate();
-  const lead = new Date(y, m - 1, 1).getDay();
-  const from = `${month}-01`;
-  const to = `${month}-${String(daysIn).padStart(2, '0')}`;
+  if (state.selDay && state.selDay >= today) state.selDay = null;
 
-  const [drawings, notes, act] = await Promise.all([
-    archive.drawingsInRange(me.id, from, to),
-    archive.notesInRange(me.id, from, to),
-    archive.activity(me.id),
-  ]);
-  if (!c.alive) return;
+  el.innerHTML = '<section id="cal-area" aria-label="月曆"></section><section id="day-pane" class="day-pane"></section>';
+  const calArea = $('#cal-area', el);
+  const pane = $('#day-pane', el);
+  let calCtx = null;
+  let dayCtx = null;
+  let calSeq = 0;
+  let daySeq = 0;
 
-  const byDay = new Map();
-  for (const d of drawings.sort((a, b) => a.createdAt - b.createdAt)) {
-    if (!byDay.has(d.day)) byDay.set(d.day, []);
-    byDay.get(d.day).push(d);
-  }
-  const noteDays = new Set(notes.map((n) => n.day));
-  const streak = streakOf(act.drawingDays, today);
+  async function paintCalendar() {
+    const seq = ++calSeq;
+    const month = state.calMonth && state.calMonth <= thisMonth ? state.calMonth : thisMonth;
+    const [y, m] = month.split('-').map(Number);
+    const daysIn = new Date(y, m, 0).getDate();
+    const lead = new Date(y, m - 1, 1).getDay();
+    const from = `${month}-01`;
+    const to = `${month}-${String(daysIn).padStart(2, '0')}`;
 
-  let cells = '';
-  for (let i = 0; i < lead; i++) cells += '<span class="cal-cell blank" aria-hidden="true"></span>';
-  for (let d = 1; d <= daysIn; d++) {
-    const key = `${month}-${String(d).padStart(2, '0')}`;
-    const list = byDay.get(key) || [];
-    const hasNote = noteDays.has(key);
-    const cls = ['cal-cell', list.length && 'has', key === today && 'today', key > today && 'future', !list.length && hasNote && 'note-only'].filter(Boolean).join(' ');
-    const label = `${m} 月 ${d} 日${list.length ? `，${list.length} 張畫` : ''}${hasNote ? '，有文字記錄' : ''}`;
-    cells += (list.length || hasNote)
-      ? `<button class="${cls}" data-day="${key}" aria-label="${label}">
-          ${list.length ? `<img src="${c.url(list[0].thumb || list[0].blob)}" alt="">` : ''}
-          <span class="cal-n">${d}</span>
-          ${list.length > 1 ? `<span class="cal-count">${list.length}</span>` : ''}
-          ${!list.length && hasNote ? '<i class="cal-dot"></i>' : ''}
-        </button>`
-      : `<span class="${cls}" aria-label="${label}"><span class="cal-n">${d}</span></span>`;
-  }
+    const [drawings, notes, act] = await Promise.all([
+      archive.drawingsInRange(me.id, from, to),
+      archive.notesInRange(me.id, from, to),
+      archive.activity(me.id),
+    ]);
+    if (!c.alive || seq !== calSeq) return;
+    calCtx?.dispose();
+    calCtx = subCtx(c);
 
-  el.innerHTML = `
-    <div class="page-head cal-head">
-      <button class="icon-btn" data-month="-1" aria-label="上個月">${icon('left')}</button>
-      <div class="cal-title">
-        <h1>${y} 年 ${m} 月</h1>
-        ${month !== thisMonth ? '<button class="link-btn" data-month="0">回到本月</button>' : '<p class="muted small">我的藝術小日曆</p>'}
+    const byDay = new Map();
+    for (const d of drawings.sort((a, b) => a.createdAt - b.createdAt)) {
+      if (!byDay.has(d.day)) byDay.set(d.day, []);
+      byDay.get(d.day).push(d);
+    }
+    const noteDays = new Set(notes.map((n) => n.day));
+    const streak = streakOf(act.drawingDays, today);
+    const sel = state.selDay || today;
+
+    let cells = '';
+    for (let i = 0; i < lead; i++) cells += '<span class="cal-cell blank" aria-hidden="true"></span>';
+    for (let d = 1; d <= daysIn; d++) {
+      const key = `${month}-${String(d).padStart(2, '0')}`;
+      const list = byDay.get(key) || [];
+      const hasNote = noteDays.has(key);
+      const isToday = key === today;
+      const cls = ['cal-cell', list.length && 'has', isToday && 'today', key > today && 'future', !list.length && hasNote && 'note-only', key === sel && 'sel'].filter(Boolean).join(' ');
+      const label = `${m} 月 ${d} 日${list.length ? `，${list.length} 張畫` : ''}${hasNote ? '，有文字記錄' : ''}${isToday ? '，今天' : ''}`;
+      cells += (list.length || hasNote || isToday)
+        ? `<button class="${cls}" data-day="${key}" aria-label="${label}" aria-pressed="${key === sel}">
+            ${list.length ? `<img src="${calCtx.url(list[0].thumb || list[0].blob)}" alt="">` : ''}
+            <span class="cal-n">${d}</span>
+            ${list.length > 1 ? `<span class="cal-count">${list.length}</span>` : ''}
+            ${!list.length && hasNote ? '<i class="cal-dot"></i>' : ''}
+          </button>`
+        : `<span class="${cls}" aria-label="${label}"><span class="cal-n">${d}</span></span>`;
+    }
+
+    calArea.innerHTML = `
+      <div class="cal-head">
+        <button class="icon-btn" data-month="-1" aria-label="上個月">${icon('left')}</button>
+        <div class="cal-title">
+          <h1>${y} 年 ${m} 月</h1>
+          <p class="cal-sum muted small">本月 ${byDay.size} 天 · ${drawings.length} 張 · 連續 ${streak} 天${month !== thisMonth ? ' · <button class="link-btn" data-month="0">回到本月</button>' : ''}</p>
+        </div>
+        <button class="icon-btn" data-month="1" aria-label="下個月" ${month >= thisMonth ? 'disabled' : ''}>${icon('right')}</button>
       </div>
-      <button class="icon-btn" data-month="1" aria-label="下個月" ${month >= thisMonth ? 'disabled' : ''}>${icon('right')}</button>
-    </div>
+      <div class="calendar card">
+        <div class="cal-weekdays">${['日', '一', '二', '三', '四', '五', '六'].map((w) => `<span>${w}</span>`).join('')}</div>
+        <div class="cal-grid">${cells}</div>
+      </div>`;
+  }
 
-    <div class="stats">
-      <div class="stat"><b>${byDay.size}</b><span>本月畫畫天數</span></div>
-      <div class="stat"><b>${drawings.length}</b><span>本月作品</span></div>
-      <div class="stat"><b>${streak}</b><span>連續天數</span></div>
-    </div>
+  async function paintDay() {
+    const seq = ++daySeq;
+    dayCtx?.dispose();
+    const k = subCtx(c);
+    dayCtx = k;
+    const day = state.selDay || today;
+    if (day === today) {
+      await mountToday(pane, k, () => paintCalendar());
+    } else {
+      const [list, note] = await Promise.all([archive.drawingsOfDay(me.id, day), archive.getNote(me.id, day)]);
+      if (!c.alive || seq !== daySeq) return;
+      if (!list.length && !note) { // 這天已經沒有內容了：回到今天
+        state.selDay = null;
+        paintCalendar();
+        paintDay();
+        return;
+      }
+      mountPastDay(pane, k, day, list, note, {
+        onBack: () => { state.selDay = null; state.calMonth = null; paintCalendar(); paintDay(); window.scrollTo(0, 0); },
+        onData: () => { paintCalendar(); paintDay(); },
+      });
+    }
+  }
 
-    <div class="calendar card">
-      <div class="cal-weekdays">${['日', '一', '二', '三', '四', '五', '六'].map((w) => `<span>${w}</span>`).join('')}</div>
-      <div class="cal-grid">${cells}</div>
-    </div>
-
-    <p class="cal-foot muted small">${icon('device', 16)}<span>以前的畫只保存在這台裝置。記得偶爾到「我的」匯出備份。</span></p>`;
-
-  el.addEventListener('click', (e) => {
+  calArea.addEventListener('click', (e) => {
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.month !== undefined) {
       const delta = Number(b.dataset.month);
-      if (delta === 0) state.calMonth = thisMonth;
-      else {
-        const dt = new Date(y, m - 1 + delta, 1);
-        state.calMonth = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
-      }
-      render();
+      const cur = state.calMonth && state.calMonth <= thisMonth ? state.calMonth : thisMonth;
+      const [cy, cm] = cur.split('-').map(Number);
+      state.calMonth = delta === 0 ? thisMonth : monthKey(new Date(cy, cm - 1 + delta, 1));
+      paintCalendar(); // 換月份不會改變選到的那天
     } else if (b.dataset.day) {
-      openDaySheet(b.dataset.day);
+      const next = b.dataset.day === today ? null : b.dataset.day;
+      if (next === state.selDay) return;
+      state.selDay = next;
+      for (const x of calArea.querySelectorAll('.cal-cell.sel')) { x.classList.remove('sel'); x.setAttribute('aria-pressed', 'false'); }
+      b.classList.add('sel');
+      b.setAttribute('aria-pressed', 'true');
+      paintDay();
     }
   });
+
+  await Promise.all([paintCalendar(), paintDay()]);
 }
 
-async function openDaySheet(day) {
-  const me = state.me;
-  const isToday = day === dayKey();
-  const [list, note] = await Promise.all([archive.drawingsOfDay(me.id, day), archive.getNote(me.id, day)]);
-  const urls = list.map((d) => URL.createObjectURL(d.blob));
-  let changed = false;
+/** 以前的某一天：唯讀（可看大圖、下載、刪除），文字記錄當成文字顯示 */
+function mountPastDay(el, c, day, list, note, { onBack, onData }) {
+  const urls = list.map((d) => c.url(d.blob));
+  const thumbs = list.map((d) => c.url(d.thumb || d.blob));
+  const p = dayParts(day);
 
-  const m = openModal({
-    title: formatDayLong(day),
-    className: 'modal-wide',
-    content: `
-      <p class="chip ${isToday ? '' : 'chip-quiet'}">${isToday
-        ? `${icon('cloud', 16)}<span>今天的畫正在分享給好友</span>`
-        : `${icon('device', 16)}<span>這天的畫只保存在這台裝置</span>`}</p>
-      ${list.length ? `<div class="sheet-grid">${list.map((d, i) => `
-        <figure class="sheet-item" data-i="${i}">
-          <button class="sheet-img" data-open="${i}" aria-label="查看大圖"><img src="${urls[i]}" alt="${formatTime(d.createdAt)} 的畫"></button>
-          <figcaption>
-            <span class="muted small">${formatTime(d.createdAt)}${d.source === 'sketch' ? ' · 隨手畫' : ''}</span>
-            <span class="sheet-actions">
-              <button class="icon-btn small" data-dl="${i}" aria-label="下載">${icon('download', 18)}</button>
-              <button class="icon-btn small" data-rm="${i}" aria-label="刪除">${icon('trash', 18)}</button>
-            </span>
-          </figcaption>
-          <ul class="comment-list compact sheet-comments" data-cmts="${esc(d.id)}" aria-label="好友的留言" hidden></ul>
-        </figure>`).join('')}</div>` : ''}
-      ${note ? `<div class="sheet-note"><p class="eyebrow">文字記錄</p><p>${esc(note)}</p></div>` : ''}
-      ${isToday ? `<div class="modal-foot"><a class="btn btn-primary" href="#/today" data-close>${icon('pen', 18)}<span>到「今天」編輯</span></a></div>` : ''}`,
-    onClose: () => {
-      setTimeout(() => urls.forEach((u) => URL.revokeObjectURL(u)), 500);
-      if (changed && parseRoute().name === 'calendar') render();
-    },
-  });
+  el.innerHTML = `
+    <section class="day-head">
+      <div class="day-head-text">
+        <p class="eyebrow">${p.year} 年 ${p.month} 月 ${p.date} 日 · ${p.weekday}</p>
+        <h2>${list.length ? `這天畫了 ${list.length} 張` : '這天的文字記錄'}</h2>
+      </div>
+      <button class="btn btn-small" data-back>${icon('sun', 18)}<span>回到今天</span></button>
+    </section>
+    <p class="chip chip-quiet">${icon('device', 16)}<span>這天的畫只保存在這台裝置</span></p>
+    ${list.length ? `<div class="sheet-grid">${list.map((d, i) => `
+      <figure class="sheet-item">
+        <button class="sheet-img" data-open="${i}" aria-label="查看大圖"><img src="${thumbs[i]}" alt="${formatTime(d.createdAt)} 的畫"></button>
+        <figcaption>
+          <span class="muted small">${formatTime(d.createdAt)}${d.source === 'sketch' ? ' · 隨手畫' : ''}</span>
+          <span class="sheet-actions">
+            <button class="icon-btn small" data-dl="${i}" aria-label="下載">${icon('download', 18)}</button>
+            <button class="icon-btn small" data-rm="${i}" aria-label="刪除">${icon('trash', 18)}</button>
+          </span>
+        </figcaption>
+        <ul class="comment-list compact sheet-comments" data-cmts="${esc(d.id)}" aria-label="好友的留言" hidden></ul>
+      </figure>`).join('')}</div>` : ''}
+    ${note ? `<div class="sheet-note"><p class="eyebrow">文字記錄</p><p>${esc(note)}</p></div>` : ''}`;
 
   // 好友在這些畫上留的字：先用本機快取，再向雲端更新（沒有留言就什麼都不顯示）
-  const paintSheetComments = (all) => {
-    for (const ul of $$('[data-cmts]', m.body)) {
+  const paintComments = (all) => {
+    if (!c.alive) return;
+    for (const ul of el.querySelectorAll('[data-cmts]')) {
       const mine = all.filter((x) => x.drawingId === ul.dataset.cmts);
       ul.innerHTML = mine.map((x) => commentHtml(x, { compact: true })).join('');
       ul.hidden = !mine.length;
@@ -1442,28 +1497,38 @@ async function openDaySheet(day) {
   };
   if (list.length) {
     const ids = list.map((d) => d.id);
-    archive.commentsOfDrawings(ids).then(paintSheetComments).catch(() => {});
-    loadComments(ids, { mine: true }).then((all) => { if (!all.failed) paintSheetComments(all); });
+    archive.commentsOfDrawings(ids).then(paintComments).catch(() => {});
+    loadComments(ids, { mine: true }).then((all) => { if (!all.failed) paintComments(all); });
   }
 
-  m.body.addEventListener('click', async (e) => {
+  el.addEventListener('click', async (e) => {
     const b = e.target.closest('button');
-    if (!b) return;
+    if (!b || !c.alive) return;
+    if (b.hasAttribute('data-back')) { onBack(); return; }
     const i = Number(b.dataset.open ?? b.dataset.dl ?? b.dataset.rm);
     const d = list[i];
     if (!d) return;
+    const fname = `art-day-${day}-${i + 1}.jpg`;
     if (b.dataset.open !== undefined) {
-      lightbox(urls[i], { caption: `${formatDayLong(day)} ${formatTime(d.createdAt)}`, onDownload: () => downloadBlob(d.blob, `art-day-${day}-${i + 1}.jpg`) });
+      openDrawingModal({
+        title: `${formatDayLong(day)} ${formatTime(d.createdAt)}`,
+        src: urls[i],
+        alt: '我的畫',
+        drawingId: d.id,
+        me: state.me,
+        isOwner: true,
+        readOnly: true,
+        actions: commentActions(true),
+        onDownload: () => downloadBlob(d.blob, fname),
+      });
     } else if (b.dataset.dl !== undefined) {
-      downloadBlob(d.blob, `art-day-${day}-${i + 1}.jpg`);
+      downloadBlob(d.blob, fname);
     } else if (b.dataset.rm !== undefined) {
-      if (!(await confirmDialog(isToday ? '刪除這張畫？會同時從這台裝置與雲端移除。' : '刪除這張畫？它只存在這台裝置，刪除後就找不回來了。', { ok: '刪除', danger: true }))) return;
+      if (!(await confirmDialog('刪除這張畫？它只存在這台裝置，刪除後就找不回來了。', { ok: '刪除', danger: true }))) return;
       try {
         await removeDrawing(d);
-        changed = true;
-        b.closest('.sheet-item').remove();
         toast('已刪除');
-        if (!$('.sheet-item', m.body) && !note) m.close();
+        onData();
       } catch (err) { toast(err.message || '刪除失敗', 'error'); }
     }
   });
