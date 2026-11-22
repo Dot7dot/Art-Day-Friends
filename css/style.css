@@ -330,6 +330,16 @@ input, textarea { font: inherit; color: var(--ink); }
 .auth-form .btn-block { margin-top: 4px; min-height: 50px; font-size: 16px; }
 .auth-demo { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; }
 
+.auth-import { display: grid; justify-items: center; gap: 4px; text-align: center; }
+.auth-import .link-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 15px; }
+.import-card {
+  display: flex; gap: 14px; align-items: flex-start; padding: 14px 16px;
+  background: var(--paper); border: var(--lw) solid var(--line); border-radius: var(--r);
+}
+.import-card-main { display: grid; gap: 8px; min-width: 0; flex: 1; }
+.import-card-title { margin: 0; font-size: 15px; line-height: 1.6; overflow-wrap: anywhere; }
+.import-card .btn-row .btn { flex: 1 1 auto; }
+
 .rules { list-style: none; margin: 0; padding: 0; width: 100%; max-width: 420px; display: grid; gap: 10px; }
 .rules li { display: flex; gap: 14px; align-items: center; }
 .rules li > div { display: grid; }
