@@ -798,7 +798,7 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
    backdrop-filter 只放在按鈕本身：放在祖先元素上會讓 position: fixed 的子元素失效 */
 
 .view-sub { margin: 0 0 16px; }
-.view.has-fab { padding-bottom: calc(var(--nav-h) + var(--safe-b) + 96px); }
+.view.has-fab { padding-bottom: calc(var(--nav-h) + var(--safe-b) + 164px); }
 
 .fab {
   position: fixed; z-index: 25;
@@ -828,7 +828,7 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
 @media (min-width: 760px) {
   /* 導覽在頂部列：按鈕放在內容區的右下角 */
   .fab { bottom: 28px; right: max(16px, calc((100vw - 760px) / 2 + 24px)); }
-  .view.has-fab { padding-bottom: 112px; }
+  .view.has-fab { padding-bottom: 180px; }
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .fab { background: rgba(255, 250, 245, .94); }
@@ -904,3 +904,124 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }
+
+
+/* ── 首頁：注意事項、許願池 ───────────────────────── */
+
+.notice {
+  margin: 4px 0 12px; padding: 14px 18px 16px;
+  background: var(--ink); color: #fff; border-radius: var(--r-lg);
+}
+.notice-title { font-size: 15px; letter-spacing: .08em; margin-bottom: 4px; color: #fff; }
+.notice-body { font-size: 13.5px; line-height: 1.7; color: rgba(255, 255, 255, .9); overflow-wrap: anywhere; }
+
+.wish-row { margin: 0 0 16px; display: flex; }
+.wish-pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px 0 12px;
+  border: var(--lw) solid var(--line); border-radius: var(--pill); background: var(--paper); color: var(--orange-ink);
+  font-size: 14px; font-weight: 800; cursor: pointer; transition: background .15s, transform .1s;
+}
+.wish-pill:hover { background: var(--wash); }
+.wish-pill:active { transform: scale(.97); }
+
+.wish-note { color: var(--ink-2); font-size: 14.5px; line-height: 1.7; padding: 12px 14px; border-radius: var(--r-sm); background: var(--paper); border: var(--lw) solid var(--line-soft); }
+.wish-form { margin-top: 14px; display: grid; gap: 10px; }
+.wish-form textarea {
+  display: block; width: 100%; min-height: 112px; resize: vertical; padding: 12px 14px;
+  border: var(--lw) solid var(--line); border-radius: var(--r); background: var(--bg); outline: none; font-size: 16px; line-height: 1.6;
+  transition: border-color .15s, box-shadow .15s;
+}
+.wish-form textarea:focus { border-color: var(--orange); box-shadow: 0 0 0 4px rgba(242, 153, 74, .16); }
+.wish-form textarea:disabled { background: var(--paper); }
+.wish-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.wish-history { margin-top: 20px; padding-top: 16px; border-top: var(--lw) dashed var(--line); }
+.wish-history h4 { margin: 0 0 6px; font-size: 15px; }
+.wish-list { list-style: none; margin: 0; padding: 0; display: grid; }
+.wish-item { padding: 10px 0; border-top: var(--lw) solid var(--line-soft); display: grid; gap: 2px; }
+.wish-item:first-child { border-top: 0; }
+.wish-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); line-height: 1.6; }
+.wish-empty { list-style: none; padding: 10px 0; text-align: center; }
+.wish-list .loading { padding: 20px 0; }
+
+/* ── 首頁第二顆液態玻璃按鈕：戳好友（在「＋」上方）────── */
+
+.fab[hidden] { display: none; }
+.fab-sm {
+  width: 48px; height: 48px;
+  right: 22px; bottom: calc(var(--nav-h) + var(--safe-b) + 16px + 60px + 12px);
+}
+.fab-sm .ico { stroke-width: 2; }
+@media (min-width: 760px) {
+  .fab-sm { bottom: calc(28px + 60px + 12px); right: calc(max(16px, calc((100vw - 760px) / 2 + 24px)) + 6px); }
+}
+
+.sheet-sub { margin: -6px 0 10px; }
+.poke-list { margin-top: 0; }
+.poke-row .btn-small { flex: none; min-width: 76px; }
+.poke-row .person-name { flex: 1; }
+.tag-small { height: 24px; padding: 0 10px; font-size: 12px; flex: none; }
+.poke-empty { list-style: none; }
+
+/* ── 「我的」最上面：誰戳了你、通知 ───────────────── */
+
+.notif-slot:empty { display: none; }
+.notif-block { margin-bottom: 20px; }
+.notif-title { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 18px; }
+.notif-title .ico { color: var(--orange-ink); }
+.poke-card, .notif-card { padding: 14px 16px; display: grid; gap: 12px; }
+.poke-card.unread { border-color: var(--orange); background: var(--paper); }
+.poke-hero { display: flex; align-items: center; gap: 12px; }
+.avatar-stack { display: flex; flex: none; }
+.avatar-stack .avatar { border: 2px solid var(--bg); }
+.avatar-stack .avatar + .avatar { margin-left: -12px; }
+.poke-line { font-size: 15.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.notif-rows { margin: 0; }
+.notif-rows .person { padding: 9px 0; }
+.poke-card.unread .notif-rows { border-top: var(--lw) solid var(--line-soft); }
+.notif-row.unread .person-name b::after, .notif-item.unread .notif-text::after {
+  content: ""; display: inline-block; width: 8px; height: 8px; margin-left: 6px; border-radius: 50%; background: var(--orange); vertical-align: 1px;
+}
+.notif-time { flex: none; }
+.notif-list { list-style: none; margin: 0; padding: 0; display: grid; }
+.notif-list li + li { border-top: var(--lw) solid var(--line-soft); }
+.notif-item {
+  display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 10px 0; text-align: left;
+  border: 0; background: none; cursor: pointer; border-radius: var(--r-sm);
+}
+.notif-item:hover { background: var(--paper); }
+.notif-main { display: grid; gap: 2px; min-width: 0; flex: 1; line-height: 1.45; }
+.notif-text { overflow-wrap: anywhere; }
+.notif-excerpt {
+  color: var(--ink-2); font-size: 14px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.notif-more { justify-self: center; }
+
+/* ── 留言回覆 ─────────────────────────────────────── */
+
+.comment-reply-to { display: flex; align-items: center; gap: 4px; margin-top: 1px; font-size: 12.5px; font-weight: 700; color: var(--orange-ink); line-height: 1.4; }
+.comment-reply-to span { overflow-wrap: anywhere; }
+.comment-reply-btn {
+  margin: 2px 0 0 -6px; padding: 2px 6px; border: 0; background: none; cursor: pointer;
+  font-size: 13px; font-weight: 800; color: var(--muted); border-radius: var(--r-xs);
+}
+.comment-reply-btn:hover { color: var(--orange-ink); background: var(--wash); }
+.comment-form { flex-wrap: wrap; }
+.reply-chip {
+  flex: 0 0 100%; display: flex; align-items: center; justify-content: space-between; gap: 4px; min-width: 0;
+  margin-bottom: 2px; padding: 3px 4px 3px 12px; border-radius: var(--pill); background: var(--wash); color: var(--orange-ink);
+  font-size: 13px; font-weight: 800;
+}
+.reply-chip[hidden] { display: none; }
+.reply-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reply-chip-x { display: grid; place-items: center; width: 26px; height: 26px; flex: none; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; }
+.reply-chip-x:hover { background: var(--line-soft); }
+
+/* ── 「我的」統計 ─────────────────────────────────── */
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.stat {
+  display: grid; justify-items: center; gap: 2px; padding: 14px 6px; min-width: 0; text-align: center;
+  border: var(--lw) solid var(--line-soft); border-radius: var(--r); background: var(--bg);
+}
+.stat b { font-size: 26px; font-weight: 900; line-height: 1.2; }
+.stat span { font-size: 12.5px; color: var(--muted); line-height: 1.4; }

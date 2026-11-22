@@ -85,7 +85,7 @@ export function notesInRange(userId, from, to) {
 // ── 留言（別人留在「我的畫」上的字）──────────────────
 
 const plainComment = (userId, c) => ({
-  id: c.id, drawingId: c.drawingId, userId, day: c.day, author: c.author, body: c.body, createdAt: c.createdAt,
+  id: c.id, drawingId: c.drawingId, userId, day: c.day, author: c.author, body: c.body, createdAt: c.createdAt, replyTo: c.replyTo || null,
 });
 
 /** 以雲端最新的結果覆蓋這些畫的留言快取（雲端已刪除的留言也會從快取消失） */

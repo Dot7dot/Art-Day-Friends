@@ -7,13 +7,23 @@ import { esc, openModal, confirmDialog, avatar, toast, setBusy } from './ui.js';
 
 export const COMMENT_MAX = 200;
 
-/** 一則留言的 HTML（內容一律跳脫） */
-export function commentHtml(c, { canDelete = false, compact = false } = {}) {
+/** 這則留言回覆的是哪一位（在同一份留言清單裡找；找不到就沒有） */
+export function replyTarget(list, c) {
+  return c.replyTo ? list.find((x) => x.id === c.replyTo)?.author || null : null;
+}
+
+/**
+ * 一則留言的 HTML（內容一律跳脫）
+ * replyTo = 被回覆的人（顯示「回覆 @xxx」）；canReply = 顯示「回覆」按鈕
+ */
+export function commentHtml(c, { canDelete = false, compact = false, canReply = false, replyTo = null } = {}) {
   return `<li class="comment ${compact ? 'compact' : ''}" data-comment="${esc(c.id)}">
     ${compact ? '' : avatar(c.author, 32)}
     <div class="comment-main">
       <div class="comment-meta"><b>${esc(c.author.displayName)}</b><span class="muted small">${esc(formatTime(c.createdAt))}</span></div>
+      ${replyTo ? `<p class="comment-reply-to">${icon('reply', 13)}<span>回覆 @${esc(replyTo.username || replyTo.displayName)}</span></p>` : ''}
       <p class="comment-body">${esc(c.body)}</p>
+      ${canReply ? `<button type="button" class="comment-reply-btn" data-reply-comment="${esc(c.id)}">回覆</button>` : ''}
     </div>
     ${canDelete ? `<button class="icon-btn small" data-del-comment="${esc(c.id)}" aria-label="刪除這則留言">${icon('trash', 17)}</button>` : ''}
   </li>`;
@@ -27,7 +37,7 @@ export function commentHtml(c, { canDelete = false, compact = false } = {}) {
  * @param {string} [o.drawingId]  有值才顯示留言區
  * @param {object} o.me           目前使用者
  * @param {boolean} o.isOwner     這是不是我的畫（我可以刪除上面的任何留言）
- * @param {object} o.actions      { load(id) -> comments[], add(id, body) -> comment, remove(comment) }
+ * @param {object} o.actions      { load(id) -> comments[], add(id, body, replyToId?) -> comment, remove(comment) }
  * @param {boolean} [o.readOnly] 只能看留言（過期的畫：不能新增或刪除）
  * @param {Function} [o.onDownload]
  * @param {Function} [o.onSave]   「存到相簿」：會在點擊當下同步呼叫（不要 await 之後才開分享表）
@@ -56,6 +66,7 @@ export function openDrawingModal(o) {
           </section>` : ''}
         </div>
         ${hasComments && !o.readOnly ? `<form class="comment-form" autocomplete="off">
+          <div class="reply-chip" data-reply-chip hidden><span class="reply-chip-text" data-reply-text></span><button type="button" class="reply-chip-x" data-reply-cancel aria-label="取消回覆">${icon('x', 14)}</button></div>
           <input name="body" maxlength="${COMMENT_MAX}" placeholder="說點什麼…" aria-label="留言內容" enterkeyhint="send">
           <span class="comment-left" data-left hidden></span>
           <button class="btn btn-primary btn-small" type="submit" aria-label="送出留言" disabled>${icon('send', 18)}<span>送出</span></button>
@@ -89,13 +100,28 @@ export function openDrawingModal(o) {
   const leftEl = m.body.querySelector('[data-left]');
   let comments = [];
   let loadFailed = false;
+  let replying = null; // 正在回覆的那則留言
+  const chip = m.body.querySelector('[data-reply-chip]');
 
   const canDelete = (c) => !o.readOnly && (o.isOwner || c.author.id === o.me.id);
+  const canReply = (c) => !!form && !o.readOnly && c.author.id !== o.me.id && !!c.author.username;
+
+  function setReply(c) {
+    replying = c;
+    if (!chip) return;
+    chip.hidden = !c;
+    if (c) {
+      chip.querySelector('[data-reply-text]').textContent = `回覆 @${c.author.username}`;
+      input.placeholder = '寫下你的回覆…';
+    } else {
+      input.placeholder = '說點什麼…';
+    }
+  }
 
   function paint(scrollToEnd = false) {
     countEl.textContent = comments.length ? String(comments.length) : '';
     list.innerHTML = comments.length
-      ? comments.map((c) => commentHtml(c, { canDelete: canDelete(c) })).join('')
+      ? comments.map((c) => commentHtml(c, { canDelete: canDelete(c), canReply: canReply(c), replyTo: replyTarget(comments, c) })).join('')
       : `<li class="comment-empty muted">${loadFailed ? '留言暫時載入不到，晚點再試試' : '還沒有留言，說點什麼吧'}</li>`;
     if (scrollToEnd) scroller.scrollTop = scroller.scrollHeight;
   }
@@ -123,14 +149,16 @@ export function openDrawingModal(o) {
     if (!body) return;
     setBusy(sendBtn, true);
     try {
-      const c = await o.actions.add(o.drawingId, body);
+      const c = await o.actions.add(o.drawingId, body, replying?.id || null);
       comments = [...comments, c];
+      setReply(null);
       input.value = '';
       refreshSend();
       paint(true);
       o.onCount?.(comments.length);
     } catch (err) {
       console.warn(err);
+      if (replying && /不見了/.test(err.message || '')) setReply(null); // 要回覆的留言已經被刪掉了
       toast(err.message || '留言失敗', 'error');
     }
     setBusy(sendBtn, false);
@@ -138,14 +166,24 @@ export function openDrawingModal(o) {
     input.focus();
   });
 
+  chip?.querySelector('[data-reply-cancel]').addEventListener('click', () => { setReply(null); input.focus(); });
+
   list.addEventListener('click', async (e) => {
+    const r = e.target.closest('[data-reply-comment]');
+    if (r) {
+      const target = comments.find((x) => x.id === r.dataset.replyComment);
+      if (target && canReply(target)) { setReply(target); input.focus(); }
+      return;
+    }
     const b = e.target.closest('[data-del-comment]');
     if (!b) return;
     const c = comments.find((x) => x.id === b.dataset.delComment);
     if (!c || !(await confirmDialog('刪除這則留言？', { ok: '刪除', danger: true }))) return;
     try {
       await o.actions.remove(c);
-      comments = comments.filter((x) => x.id !== c.id);
+      comments = comments.filter((x) => x.id !== c.id)
+        .map((x) => (x.replyTo === c.id ? { ...x, replyTo: null } : x)); // 回覆它的留言：沒有回覆對象了
+      if (replying?.id === c.id) setReply(null);
       paint();
       o.onCount?.(comments.length);
     } catch (err) {
