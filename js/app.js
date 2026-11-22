@@ -1191,7 +1191,7 @@ function mountAddButton(el, c, mine) {
 function noticeHtml() {
   return `<section class="notice" aria-label="注意事項">
     <h2 class="notice-title">注意事項</h2>
-    <p class="notice-body">這是點點實驗室目前在開發的 App，歡迎邀請你的好朋友一起來測試。如果出了問題，點點會再想辦法修正，有任何問題可以直接詢問點點實驗室的 IG 帳號。</p>
+    <p class="notice-body">這是點點實驗室目前在開發的 App，歡迎邀請你的好朋友一起來測試。如果出了問題，點點會再想辦法修正，有任何問題可以直接詢問點點實驗室的 IG 帳號 <a class="notice-link" href="https://www.instagram.com/dot._.dot_lab/" target="_blank" rel="noopener noreferrer" aria-label="開啟點點實驗室的 Instagram">@dot._.dot_lab</a>。</p>
   </section>`;
 }
 
