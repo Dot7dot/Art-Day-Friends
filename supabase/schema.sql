@@ -14,6 +14,7 @@
 --    非好友也看得到（只能看，不能留言）。預設關閉，要使用者自己打開。
 --  • 留言可以回覆別人（reply_to）；被回覆的人與被「戳」的人會收到通知（notifications）。
 --  • 許願池（wishes）：使用者許願新功能，只有本人看得到自己的願望，網站管理員在 Dashboard 看全部。
+--  • 打氣區（cheers）：登入的使用者互相留言打氣，每則保留 3 天，本人可編輯、刪除。
 -- ════════════════════════════════════════════════════════════════
 
 
@@ -738,8 +739,93 @@ create or replace view public.wishes_with_author as
 revoke all on public.wishes_with_author from public, anon, authenticated;
 
 
+-- ── 5d. 打氣區 ──────────────────────────────────────────────────
+--  • 所有登入的使用者都看得到大家的打氣留言（不限好友），每則最多 200 字，只保留 3 天。
+--  • 只有本人可以編輯（只能改內容 body）或刪除自己的留言；編輯不會延長 3 天的期限。
+--  • 24 小時內每人最多 20 則。過期的留言 RLS 就讀不到，並由 purge_expired() 清掉。
+--  • 網站管理員移除不適當的留言：SQL Editor 執行  select public.admin_delete_cheer('留言id');
+--    或  delete from public.cheers where id = '留言id';（Dashboard → Table Editor → cheers 也可以）
+create table if not exists public.cheers (
+  id         uuid primary key default gen_random_uuid(),
+  author     uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  body       text not null check (char_length(btrim(body)) between 1 and 200),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz,
+  expires_at timestamptz not null default now() + interval '3 days'
+);
+
+create index if not exists cheers_expires_idx on public.cheers (expires_at desc);
+create index if not exists cheers_created_idx on public.cheers (created_at desc);
+create index if not exists cheers_author_idx on public.cheers (author, created_at desc);
+
+alter table public.cheers enable row level security;
+
+drop policy if exists "cheers: read live" on public.cheers;
+create policy "cheers: read live" on public.cheers
+  for select to authenticated using (expires_at > now());
+
+drop policy if exists "cheers: insert own" on public.cheers;
+create policy "cheers: insert own" on public.cheers
+  for insert to authenticated with check (author = (select auth.uid()));
+
+drop policy if exists "cheers: update own" on public.cheers;
+create policy "cheers: update own" on public.cheers
+  for update to authenticated
+  using (author = (select auth.uid()) and expires_at > now())
+  with check (author = (select auth.uid()));
+
+drop policy if exists "cheers: delete own" on public.cheers;
+create policy "cheers: delete own" on public.cheers
+  for delete to authenticated using (author = (select auth.uid()));
+
+revoke all on public.cheers from public, anon, authenticated;
+grant select, insert, delete on public.cheers to authenticated;
+grant update (body) on public.cheers to authenticated;      -- 只能改內容
+
+create or replace function public.guard_cheer()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if tg_op = 'INSERT' then
+    new.body := btrim(new.body);
+    new.created_at := now();
+    new.expires_at := now() + interval '3 days';
+    new.updated_at := null;
+    if (select count(*) from public.cheers c
+         where c.author = new.author and c.created_at > now() - interval '24 hours') >= 20 then
+      raise exception 'cheer limit reached';
+    end if;
+  else
+    if new.author is distinct from old.author
+       or new.created_at is distinct from old.created_at
+       or new.expires_at is distinct from old.expires_at then
+      raise exception 'cheer fields are read-only';
+    end if;
+    new.body := btrim(new.body);
+    new.updated_at := now();
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.guard_cheer() from public, anon;
+
+drop trigger if exists cheers_guard on public.cheers;
+drop trigger if exists cheers_guard_ins on public.cheers;
+drop trigger if exists cheers_guard_upd on public.cheers;
+create trigger cheers_guard_ins
+  before insert on public.cheers
+  for each row execute function public.guard_cheer();
+create trigger cheers_guard_upd
+  before update on public.cheers
+  for each row execute function public.guard_cheer();
+
+
 -- ── 6. 自動清除過期資料 ──────────────────────────────────────────
--- 只清畫、當天文字與 30 天前的通知；留言（drawing_comments）刻意不清，畫的主人要永遠看得到。
+-- 只清畫、當天文字、過期的打氣留言與 30 天前的通知；留言（drawing_comments）刻意不清，畫的主人要永遠看得到。
 create or replace function public.purge_expired()
 returns integer
 language plpgsql
@@ -756,6 +842,7 @@ begin
   get diagnostics m = row_count;
   delete from public.notifications where created_at < now() - interval '30 days';
   delete from public.poke_log where created_at < now() - interval '2 days';
+  delete from public.cheers where expires_at <= now();
   return n + m;
 end;
 $$;
@@ -1262,3 +1349,22 @@ revoke execute on function public.admin_find_users(text) from public, anon, auth
 revoke execute on function public.admin_reset_password(text, text) from public, anon, authenticated;
 revoke execute on function public.admin_fix_login_email(uuid, text) from public, anon, authenticated;
 revoke execute on function public.admin_migrate_email_logins() from public, anon, authenticated;
+
+-- 打氣區：管理員刪除不適當的留言（同樣只有 SQL Editor 能用）
+--   select public.admin_delete_cheer('留言id');   -- 留言 id 可在 Table Editor → cheers 找到
+create or replace function public.admin_delete_cheer(p_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  n integer;
+begin
+  delete from public.cheers where id = p_id;
+  get diagnostics n = row_count;
+  return case when n > 0 then 'ok: cheer deleted' else 'not found' end;
+end;
+$$;
+
+revoke execute on function public.admin_delete_cheer(uuid) from public, anon, authenticated;
