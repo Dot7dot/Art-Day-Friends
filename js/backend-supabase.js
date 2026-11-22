@@ -192,6 +192,15 @@ export async function createSupabaseBackend(url, anonKey) {
       } finally { authBusy = false; }
     },
 
+    /** 修改密碼：已登入就不用輸入舊密碼 */
+    async changePassword(newPassword) {
+      const { error } = await sb.auth.updateUser({ password: newPassword });
+      if (!error) return;
+      if (/different from the old/i.test(error.message)) throw new Error('新密碼不能和目前的密碼一樣');
+      if (/at least|weak|short/i.test(error.message)) throw new Error('新密碼至少需要 6 個字元');
+      throw friendly(error);
+    },
+
     async signOut() {
       me = null;
       await sb.auth.signOut();

@@ -179,14 +179,38 @@ export async function exportArchive(user) {
   };
 }
 
-/** 匯入備份；makeThumb(blob) 用來重新產生縮圖。回傳新增的張數 */
-export async function importArchive(userId, data, { makeThumb, dataURLToBlob }) {
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const validDrawing = (d) => !!d && !!d.id && DAY_RE.test(d.day) && typeof d.image === 'string';
+const validNote = (n) => !!n && DAY_RE.test(n.day) && typeof n.text === 'string' && !!n.text.trim();
+const NOT_BACKUP = '這不是 Art Day 的存檔。請選擇在「我的 → 匯出備份」得到的 .json 檔';
+
+/** 讀備份檔的文字並檢查格式；回傳 { data, summary:{ username, drawings, notes } }，不對就丟出白話的錯誤 */
+export function parseBackup(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error(NOT_BACKUP); }
+  if (!data || typeof data !== 'object' || data.app !== 'art-day' || !Array.isArray(data.drawings)) throw new Error(NOT_BACKUP);
+  const username = String(data.username || '').trim().replace(/^@/, '').toLowerCase();
+  return {
+    data,
+    summary: {
+      username,
+      drawings: data.drawings.filter(validDrawing).length,
+      notes: (Array.isArray(data.notes) ? data.notes : []).filter(validNote).length,
+    },
+  };
+}
+
+/** 匯入備份；makeThumb(blob) 用來重新產生縮圖；onProgress(done, total) 回報進度。回傳新增的張數 */
+export async function importArchive(userId, data, { makeThumb, dataURLToBlob, onProgress }) {
   if (!data || data.app !== 'art-day' || !Array.isArray(data.drawings)) {
     throw new Error('這不是 Art Day 的備份檔');
   }
   let added = 0;
+  let done = 0;
+  const total = data.drawings.length;
   for (const d of data.drawings) {
-    if (!d.id || !/^\d{4}-\d{2}-\d{2}$/.test(d.day) || typeof d.image !== 'string') continue;
+    onProgress?.(done++, total);
+    if (!validDrawing(d)) continue;
     const existing = await getDrawing(d.id);
     if (existing) continue;
     const blob = dataURLToBlob(d.image);
@@ -197,6 +221,7 @@ export async function importArchive(userId, data, { makeThumb, dataURLToBlob }) 
     });
     added++;
   }
+  onProgress?.(total, total);
   for (const n of data.notes || []) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(n.day) || typeof n.text !== 'string') continue;
     const current = await getNote(userId, n.day);

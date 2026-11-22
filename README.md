@@ -139,13 +139,38 @@ Art Day 是一個給藝術家的小日曆：
 - **已經在使用雲端模式的話**：請把最新的 [`supabase/schema.sql`](supabase/schema.sql) 在 SQL Editor 整份再執行一次（可重複執行）。在那之前，「我的」裡這一區會自動隱藏，登入畫面按「忘記密碼？」會提示功能尚未開啟，其他功能不受影響。
 - 示範模式有同樣的流程，資料只存在這台裝置。
 
-**最後的手段**：沒設定問題、或被鎖住的人，可以請管理者在 Supabase 的 **SQL Editor** 幫忙重設（把 `某人的ID` 和 `新密碼` 換掉）：
+### 幫使用者重設密碼（管理員的後門）
 
-```sql
-update auth.users
-   set encrypted_password = extensions.crypt('新密碼', extensions.gen_salt('bf'))
- where email = '某人的ID@users.art-day.invalid';
-```
+沒設定問題、被鎖住、或根本登不進去的人，可以請管理員用 SQL 幫忙救援。這些函式**只能在 Supabase 後台的 SQL Editor 執行**（角色 `postgres`）；網站和已登入的使用者呼叫會得到 permission denied，所以不會變成網站上的漏洞。需要先把最新的 [`supabase/schema.sql`](supabase/schema.sql) 整份執行過一次（第 8 節）。
+
+1. 打開 Supabase Dashboard → **SQL Editor**。
+2. 找人（不確定 ID 的話，可以用 ID 或暱稱的一部分搜尋，最多 50 筆）：
+   ```sql
+   select * from admin_find_users('momo');
+   ```
+3. 看這個帳號的狀況（為什麼登入不了）：
+   ```sql
+   select * from admin_user_status('momo_draws');
+   ```
+4. 重設成臨時密碼（至少 6 個字元）：
+   ```sql
+   select admin_reset_password('momo_draws', '臨時密碼123');
+   ```
+   成功會回傳 `ok: password reset for @momo_draws`。它同時會把還沒確認的信箱標成已確認、解除「忘記密碼」的鎖定、並讓舊的登入失效。
+5. 把臨時密碼告訴使用者，請他登入後到 **我的 → 密碼 → 修改密碼** 改成自己的（登入後改密碼不用輸入舊密碼）。
+
+**常見登不進去的原因**（`admin_user_status` 看得出來）：
+
+- **ID 打錯**：`admin_user_status` 查不到任何資料 → 用 `admin_find_users` 找正確的 ID，請使用者照著輸入（不分大小寫，前面的 `@` 可有可無）。
+- **早期用 email 註冊**：`login_email` 不是 `…@users.art-day.invalid`，而是真正的 email → 請他在登入欄位輸入**那個 email**（含 `@` 的輸入會直接當 email 登入），或直接幫他重設密碼。
+- **信箱未確認**：`email_confirmed` 是 `false`（例如 Supabase 的 Confirm email 曾經開著）→ 重設密碼時會一併標成已確認；也請到 Authentication → Providers → Email 把 **Confirm email** 關掉。
+- **忘記密碼被鎖住**：`recovery_locked` 是 `true`（24 小時內答錯 5 次），或 `has_recovery_answers` 是 `false`（沒設定問題）→ 重設密碼會一併清除鎖定。
+
+> 注意：`admin_reset_password` 直接更新 `auth.users` 的密碼雜湊。如果 SQL Editor 回報無法更新 `auth.users`，錯誤訊息會直接說明；也請記得臨時密碼會留在 SQL Editor 的執行紀錄裡，所以要請使用者盡快改掉。
+
+### 登入畫面的「匯入存檔」
+
+換手機或帳號找不回來時，只要有當初在 **我的 → 匯出備份** 存下的 `.json` 檔：在登入畫面按 **匯入存檔** 選檔，確認摘要（「這份存檔是 @某人 的，共 N 張畫、M 篇文字」）後，登入或註冊新帳號，就會自動把畫與文字匯入（只存在這台裝置，不會上傳雲端）。如果存檔屬於另一個 ID，會先問你要不要匯入到目前的帳號。選好的存檔會暫存在瀏覽器裡，重新整理也不會不見，匯入或按「取消」後才清掉。
 
 ## 發佈到 GitHub Pages
 

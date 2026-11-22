@@ -3,6 +3,7 @@
 
 import { SUPABASE_URL, SUPABASE_ANON_KEY, MAX_CLOUD_DRAWINGS_PER_DAY as CLOUD_MAX } from './config.js';
 import * as archive from './archive.js';
+import * as pending from './pending-import.js';
 import { processImage, cloudCopy, makeThumb, dataURLToBlob, makeAvatar } from './imaging.js';
 import { icon } from './icons.js';
 import { dayKey, addDays, endOfDay, dayParts, formatDayLong, formatDayShort, timeLeftToday, formatTime, formatAgo } from './dates.js';
@@ -331,7 +332,13 @@ function renderAuth() {
           <button type="button" role="tab" data-mode="signup">註冊</button>
           <button type="button" role="tab" data-mode="login">登入</button>
         </div>
+        <div data-pending-slot></div>
         <form class="auth-form" novalidate></form>
+        <div class="auth-import">
+          <button type="button" class="link-btn" data-import-backup>${icon('upload', 16)}<span>匯入存檔</span></button>
+          <span class="field-hint">有備份檔（換手機、找不回帳號）？先在這裡匯入</span>
+          <input type="file" data-import-file accept=".json,application/json" hidden>
+        </div>
       </div>
       <ul class="rules">
         <li><span class="rule-ico">${icon('users')}</span><div><b>加好友</b><span>就能看到對方今天畫的圖</span></div></li>
@@ -377,10 +384,54 @@ function renderAuth() {
     if (e.target.closest('[data-forgot]')) openForgotPassword(form.elements.username?.value);
   });
 
+  const setMode = (m) => { if (m !== mode) { mode = m; paint(); } };
   $('.segmented').addEventListener('click', (e) => {
     const b = e.target.closest('[data-mode]');
-    if (b && b.dataset.mode !== mode) { mode = b.dataset.mode; paint(); }
+    if (b) setMode(b.dataset.mode);
   });
+
+  // ── 匯入存檔：選檔 → 檢查 → 存進 IndexedDB → 顯示摘要卡，登入／註冊後自動匯入 ──
+  const slot = $('[data-pending-slot]');
+  const paintPending = (meta) => {
+    if (!meta) { slot.innerHTML = ''; return; }
+    const who = meta.username ? `這份存檔是 <b>@${esc(meta.username)}</b> 的，` : '這份存檔';
+    slot.innerHTML = `<div class="import-card" role="status">
+      <span class="rule-ico">${icon('upload')}</span>
+      <div class="import-card-main">
+        <p class="import-card-title">${who}共 <b>${meta.drawings}</b> 張畫、<b>${meta.notes}</b> 篇文字</p>
+        <p class="field-hint">登入或註冊後，會自動匯入到你的帳號（只存在這台裝置）。</p>
+        <div class="btn-row">
+          <button type="button" class="btn btn-small ${mode === 'login' ? 'btn-primary' : ''}" data-pending-go="login">登入</button>
+          <button type="button" class="btn btn-small ${mode === 'signup' ? 'btn-primary' : ''}" data-pending-go="signup">註冊新帳號</button>
+          <button type="button" class="btn btn-small btn-ghost" data-pending-cancel>取消</button>
+        </div>
+      </div></div>`;
+  };
+  slot.addEventListener('click', async (e) => {
+    const go = e.target.closest('[data-pending-go]');
+    if (go) { setMode(go.dataset.pendingGo); paintPending(await pending.getPendingMeta()); form.elements.username?.focus(); return; }
+    if (e.target.closest('[data-pending-cancel]')) {
+      await pending.clearPending();
+      paintPending(null);
+      toast('已取消匯入存檔');
+    }
+  });
+  $('[data-import-backup]').addEventListener('click', () => $('[data-import-file]').click());
+  $('[data-import-file]').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const { data, summary } = archive.parseBackup(await file.text());
+      if (!summary.drawings && !summary.notes) throw new Error('這份存檔裡沒有可以匯入的畫或文字');
+      await pending.savePending(data, summary);
+      paintPending(await pending.getPendingMeta());
+    } catch (ex) {
+      console.warn(ex);
+      toast(ex.message || '讀取存檔失敗', 'error');
+    }
+  });
+  pending.getPendingMeta().then(paintPending);
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -411,6 +462,7 @@ function renderAuth() {
         setBusy(btn, true, '登入中…');
         state.me = await state.backend.signIn({ login: username, password });
         localStorage.setItem('artday.hasAccount', '1');
+        await runPendingImport(state.me);
       }
       render();
     } catch (ex) {
@@ -419,6 +471,55 @@ function renderAuth() {
       fail(ex.message || '發生錯誤，請再試一次');
     }
   });
+}
+
+/** 把「待匯入的存檔」匯入這個帳號，顯示進度與結果，成功後清掉。出錯或使用者不同意時，存檔會繼續保留 */
+async function importPending(user, meta) {
+  const big = meta.drawings >= 12;
+  let m = null;
+  let bar = null;
+  let label = null;
+  if (big) {
+    m = openModal({
+      title: '匯入存檔', className: 'modal-small album-saver', beforeClose: () => false,
+      content: `<p class="confirm-text">正在匯入，請先不要關閉頁面…</p>
+        <div class="progress"><i></i></div><p class="muted small" data-count>0 / ${meta.drawings}</p>`,
+    });
+    bar = $('.progress > i', m.body);
+    label = $('[data-count]', m.body);
+  }
+  try {
+    const data = await pending.getPendingData();
+    if (!data) { await pending.clearPending(); return; }
+    const added = await archive.importArchive(user.id, data, {
+      makeThumb, dataURLToBlob,
+      onProgress: big ? (done, total) => {
+        bar.style.width = `${total ? Math.round((done / total) * 100) : 100}%`;
+        label.textContent = `${done} / ${total}`;
+      } : undefined,
+    });
+    await pending.clearPending();
+    m?.close(true);
+    toast(added ? `已匯入 ${added} 張畫${meta.notes ? `、${meta.notes} 篇文字` : ''}` : '沒有新的畫需要匯入（都已經在日曆裡了）');
+    return true;
+  } catch (ex) {
+    console.warn(ex);
+    m?.close(true);
+    toast(`${ex.message || '匯入失敗'}。存檔還保留著，可以到「我的」再試一次`, 'error');
+    return false;
+  }
+}
+
+/** 登入／註冊之後呼叫：有待匯入的存檔就匯入；存檔的帳號和現在的不同時先問過 */
+async function runPendingImport(user) {
+  let meta;
+  try { meta = await pending.getPendingMeta(); } catch { return; }
+  if (!meta) return;
+  if (meta.username && meta.username !== user.username) {
+    const ok = await confirmDialog(`這份存檔是 @${meta.username} 的，要匯入到 @${user.username} 嗎？`, { title: '匯入存檔', ok: '匯入', cancel: '先不要' });
+    if (!ok) { toast('存檔先保留著，之後可以到「我的」匯入或捨棄'); return; }
+  }
+  return importPending(user, meta);
 }
 
 /** 註冊成功後的第二步：設定忘記密碼的兩個問題（可跳過），之後都會進到 App */
@@ -433,6 +534,7 @@ function showRecoveryStep() {
     }
     if (canShare) markRecoCardSeen();
     toast(`歡迎，${state.me.displayName}！`);
+    await runPendingImport(state.me);
     render();
   };
   card.innerHTML = `
@@ -2349,7 +2451,7 @@ function openAlbumSaver(items) {
 
 async function viewMe(el, c) {
   const me = state.me;
-  const [act, est, persisted, recovery, notifs] = await Promise.all([
+  const [act, est, persisted, recovery, notifs, pendingMeta] = await Promise.all([
     archive.activity(me.id),
     navigator.storage?.estimate?.().catch(() => null),
     navigator.storage?.persisted?.().catch(() => false),
@@ -2359,6 +2461,7 @@ async function viewMe(el, c) {
       if (e?.code === 'FEATURE_UNSUPPORTED') state.notifOk = false; else console.warn(e);
       return [];
     }),
+    pending.getPendingMeta(),
   ]);
   if (!c.alive) return;
   const streak = streakOf(act.drawingDays, state.today);
@@ -2406,6 +2509,14 @@ async function viewMe(el, c) {
       </div>
     </section>` : ''}
 
+    <section class="section">
+      <h2>密碼</h2>
+      <div class="card stack">
+        <p>登入後改密碼不用輸入舊密碼。如果你拿到的是管理員幫你重設的臨時密碼，請在這裡改成自己的。</p>
+        <div class="btn-row"><button class="btn" data-change-password>${icon('shield', 18)}<span>修改密碼</span></button></div>
+      </div>
+    </section>
+
     ${recovery.supported ? `<section class="section" data-recovery>
       <h2>忘記密碼的問題</h2>
       <div class="card stack">
@@ -2448,6 +2559,12 @@ async function viewMe(el, c) {
     <section class="section">
       <h2>本機保存</h2>
       <div class="card stack">
+        ${pendingMeta ? `<div class="import-card" data-pending-card>
+          <span class="rule-ico">${icon('upload')}</span>
+          <div class="import-card-main">
+            <p class="import-card-title">有一份還沒匯入的存檔${pendingMeta.username ? `（@${esc(pendingMeta.username)}）` : ''}，共 <b>${pendingMeta.drawings}</b> 張畫、<b>${pendingMeta.notes}</b> 篇文字</p>
+            <div class="btn-row"><button class="btn btn-small btn-primary" data-pending-import>匯入到這個帳號</button><button class="btn btn-small btn-ghost" data-pending-discard>捨棄</button></div>
+          </div></div>` : ''}
         <p>你所有的畫都保存在<b>這台裝置的瀏覽器</b>裡。清除瀏覽器資料或換手機前，記得先匯出備份。</p>
         <div class="kv"><span>目前使用空間</span><b>${est ? formatBytes(est.usage) : '—'}</b></div>
         <div class="kv"><span>防止瀏覽器自動清除</span>
@@ -2544,6 +2661,17 @@ async function viewMe(el, c) {
         toast('已移除');
         render();
       } catch (err) { toast(err.message || '移除失敗', 'error'); }
+    } else if (b.hasAttribute('data-change-password')) {
+      changePassword();
+    } else if (b.hasAttribute('data-pending-import')) {
+      setBusy(b, true, '匯入中…');
+      await runPendingImport(me);
+      render();
+    } else if (b.hasAttribute('data-pending-discard')) {
+      if (!(await confirmDialog('捨棄後，這份存檔就不會被匯入了（檔案本身還在你的手機或電腦裡）。', { title: '捨棄存檔', ok: '捨棄', danger: true }))) return;
+      await pending.clearPending();
+      toast('已捨棄這份存檔');
+      render();
     } else if (b.hasAttribute('data-install')) {
       const ev = installEvent;
       if (!ev) return;
@@ -2657,6 +2785,43 @@ function editRecovery(isSet) {
     } catch (ex) {
       setBusy(btn, false);
       err.textContent = ex.message || '儲存失敗';
+      err.hidden = false;
+    }
+  });
+}
+
+function changePassword() {
+  const m = openModal({
+    title: '修改密碼',
+    className: 'modal-small',
+    content: `<form class="stack" id="password-form" novalidate>
+      <p class="muted small">不需要輸入舊密碼。改好後，目前的登入狀態會保留。</p>
+      <label class="field"><span class="field-label">新密碼</span>
+        <input name="newPassword" type="password" autocomplete="new-password" minlength="6" required placeholder="至少 6 個字元" autofocus></label>
+      <label class="field"><span class="field-label">再輸入一次新密碼</span>
+        <input name="confirm" type="password" autocomplete="new-password" required></label>
+      <p class="form-error" role="alert" hidden></p>
+      <div class="modal-foot"><button type="button" class="btn" data-close>取消</button><button class="btn btn-primary" type="submit">更新密碼</button></div>
+    </form>`,
+  });
+  const form = $('#password-form', m.body);
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const err = $('.form-error', form);
+    const { newPassword, confirm } = Object.fromEntries(new FormData(form));
+    const bad = newPassword.length < 6 ? '新密碼至少需要 6 個字元' : newPassword !== confirm ? '兩次輸入的新密碼不一樣' : '';
+    err.hidden = !bad; err.textContent = bad;
+    if (bad) return;
+    const btn = $('button[type="submit"]', form);
+    setBusy(btn, true, '更新中…');
+    try {
+      await state.backend.changePassword(newPassword);
+      m.close(true);
+      toast('已更新密碼');
+    } catch (ex) {
+      console.warn(ex);
+      setBusy(btn, false);
+      err.textContent = ex.message || '更新失敗，請再試一次';
       err.hidden = false;
     }
   });

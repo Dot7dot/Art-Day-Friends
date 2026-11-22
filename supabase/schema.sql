@@ -995,3 +995,145 @@ grant execute on function public.clear_recovery_answers() to authenticated;
 grant execute on function public.recovery_status() to authenticated;
 grant execute on function public.recovery_available(text) to anon, authenticated;
 grant execute on function public.reset_password_with_answers(text, text, text, text) to anon, authenticated;
+
+-- ============================================================
+-- 8. 管理員工具：幫使用者救援帳號（只有 Supabase 後台的 SQL Editor 能用）
+-- ============================================================
+-- 這三個函式「不能」從網站呼叫：下面明確收回了 public／anon／authenticated 的執行權限，
+-- 只有登入 Supabase Dashboard、在 SQL Editor（角色 postgres）執行的人才跑得動。
+-- 網站（含已登入的使用者）呼叫會得到 permission denied。
+--
+-- 用法（在 Supabase → SQL Editor 貼上執行，把 xxx 換掉）：
+--
+--   -- 1. 不確定對方的 ID 時：用 ID 或暱稱的一部分搜尋（最多 50 筆）
+--   select * from public.admin_find_users('xxx');
+--
+--   -- 2. 看某個帳號為什麼登入不了（登入用的信箱、信箱有沒有確認、問題是否被鎖住…）
+--   select * from public.admin_user_status('momo_draws');
+--
+--   -- 3. 幫對方重設成臨時密碼（至少 6 個字元），再請對方登入後到「我的 → 修改密碼」自己改掉
+--   select public.admin_reset_password('momo_draws', '臨時密碼123');
+--
+-- admin_reset_password 同時會：把尚未確認的信箱標成已確認、清除「忘記密碼」答錯的紀錄（解除鎖定）、
+-- 並讓舊的登入失效。注意：SQL Editor 會保留執行過的語句，臨時密碼用完就請對方改掉。
+
+create or replace function public.admin_user_status(p_username text)
+returns table (
+  username text,
+  display_name text,
+  user_id uuid,
+  created_at timestamptz,
+  last_sign_in_at timestamptz,
+  login_email text,
+  email_confirmed boolean,
+  has_recovery_answers boolean,
+  recovery_failures_24h integer,
+  recovery_locked boolean
+)
+language sql
+security definer
+set search_path = ''
+as $$
+  select p.username, p.display_name, p.id, u.created_at, u.last_sign_in_at, u.email::text,
+         (u.email_confirmed_at is not null),
+         exists (select 1 from public.recovery_answers r where r.user_id = p.id),
+         f.n,
+         f.n >= 5
+    from public.profiles p
+    left join auth.users u on u.id = p.id
+    cross join lateral (
+      select count(*)::integer as n from public.recovery_attempts a
+       where a.user_id = p.id and not a.success and a.attempted_at > now() - interval '24 hours'
+    ) f
+   where p.username = lower(regexp_replace(btrim(coalesce(p_username, '')), '^@', ''));
+$$;
+
+create or replace function public.admin_find_users(p_query text)
+returns table (
+  username text,
+  display_name text,
+  user_id uuid,
+  created_at timestamptz,
+  last_sign_in_at timestamptz,
+  login_email text,
+  email_confirmed boolean,
+  has_recovery_answers boolean,
+  recovery_locked boolean
+)
+language sql
+security definer
+set search_path = ''
+as $$
+  select p.username, p.display_name, p.id, u.created_at, u.last_sign_in_at, u.email::text,
+         (u.email_confirmed_at is not null),
+         exists (select 1 from public.recovery_answers r where r.user_id = p.id),
+         (select count(*) from public.recovery_attempts a
+           where a.user_id = p.id and not a.success and a.attempted_at > now() - interval '24 hours') >= 5
+    from public.profiles p
+    left join auth.users u on u.id = p.id
+   where btrim(coalesce(p_query, '')) <> ''
+     and (p.username ilike '%' || replace(replace(replace(lower(regexp_replace(btrim(p_query), '^@', '')), '\', '\\'), '%', '\%'), '_', '\_') || '%'
+       or p.display_name ilike '%' || replace(replace(replace(btrim(p_query), '\', '\\'), '%', '\%'), '_', '\_') || '%')
+   order by p.username
+   limit 50;
+$$;
+
+create or replace function public.admin_reset_password(p_username text, p_new_password text)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uname text := lower(regexp_replace(btrim(coalesce(p_username, '')), '^@', ''));
+  uid uuid;
+  n integer;
+begin
+  select p.id into uid from public.profiles p where p.username = uname;
+  if uid is null then
+    raise exception '找不到使用者 @%（請用 admin_find_users 搜尋確認 ID）', uname;
+  end if;
+  if char_length(coalesce(p_new_password, '')) < 6 then
+    raise exception '新密碼至少需要 6 個字元';
+  end if;
+
+  begin
+    update auth.users
+       set encrypted_password = extensions.crypt(p_new_password, extensions.gen_salt('bf')),
+           email_confirmed_at = coalesce(email_confirmed_at, now()),
+           updated_at = now()
+     where id = uid;
+    get diagnostics n = row_count;
+  exception when others then
+    raise exception '無法更新 auth.users（%）。請確認是在 Supabase SQL Editor（postgres 角色）執行', sqlerrm;
+  end;
+  if n = 0 then
+    raise exception '@% 有檔案，但 auth.users 裡找不到對應的帳號', uname;
+  end if;
+
+  -- 清除「忘記密碼」答錯的紀錄（解除鎖定）
+  begin
+    delete from public.recovery_attempts where user_id = uid and not success;
+  exception when others then
+    null;
+  end;
+  -- 讓舊的登入失效（資料表不存在或沒權限時略過）
+  begin
+    delete from auth.refresh_tokens where user_id = uid::text;
+  exception when others then
+    null;
+  end;
+  begin
+    delete from auth.sessions where user_id = uid;
+  exception when others then
+    null;
+  end;
+
+  return 'ok: password reset for @' || uname;
+end;
+$$;
+
+-- Supabase 預設會把新函式的執行權限給 anon／authenticated，所以一定要明確收回；不授權給任何人。
+revoke execute on function public.admin_user_status(text) from public, anon, authenticated;
+revoke execute on function public.admin_find_users(text) from public, anon, authenticated;
+revoke execute on function public.admin_reset_password(text, text) from public, anon, authenticated;

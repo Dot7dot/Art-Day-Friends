@@ -227,6 +227,13 @@ export async function createLocalBackend() {
       return me;
     },
 
+    async changePassword(newPassword) {
+      if (newPassword.length < 6) throw new Error('新密碼至少需要 6 個字元');
+      const salt = randomHex(8);
+      const hash = await sha256(`${salt}:${newPassword}`);
+      write(K_USERS, allUsers().map((u) => (u.id === me.id ? { ...u, salt, hash } : u)));
+    },
+
     async signOut() {
       localStorage.removeItem(K_SESSION);
       me = null;
