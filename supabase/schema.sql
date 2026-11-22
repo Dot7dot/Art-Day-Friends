@@ -12,6 +12,8 @@
 --  • 好友可以在今天的畫上留言；留言是很小的純文字，永久保留給畫的主人。
 --  • 推薦貼文（選擇加入）：profiles.share_public = true 的人，今天的畫與文字
 --    非好友也看得到（只能看，不能留言）。預設關閉，要使用者自己打開。
+--  • 留言可以回覆別人（reply_to）；被回覆的人與被「戳」的人會收到通知（notifications）。
+--  • 許願池（wishes）：使用者許願新功能，只有本人看得到自己的願望，網站管理員在 Dashboard 看全部。
 -- ════════════════════════════════════════════════════════════════
 
 
@@ -457,6 +459,9 @@ create table if not exists public.drawing_comments (
   created_at    timestamptz not null default now()
 );
 
+-- 回覆：指向被回覆的那則留言（同一張畫）；被回覆的留言刪除後變成 null
+alter table public.drawing_comments add column if not exists reply_to uuid references public.drawing_comments (id) on delete set null;
+
 create index if not exists drawing_comments_drawing_idx on public.drawing_comments (drawing_id, created_at);
 create index if not exists drawing_comments_owner_idx on public.drawing_comments (drawing_owner, day);
 
@@ -506,7 +511,7 @@ revoke all on public.drawing_comments from anon;
 revoke update on public.drawing_comments from authenticated;
 grant select, insert, delete on public.drawing_comments to authenticated;
 
--- 寫入時把關：從畫複製 drawing_owner / day、畫必須還沒過期、每人每張畫最多 30 則
+-- 寫入時把關：從畫複製 drawing_owner / day、畫必須還沒過期、每人每張畫最多 30 則、回覆的對象必須在同一張畫上
 create or replace function public.guard_comment()
 returns trigger
 language plpgsql
@@ -524,6 +529,12 @@ begin
   new.day := d.day;
   new.created_at := now();
   new.body := btrim(new.body);
+  -- 回覆的對象必須是同一張畫上的留言
+  if new.reply_to is not null and not exists (
+    select 1 from public.drawing_comments p where p.id = new.reply_to and p.drawing_id = new.drawing_id
+  ) then
+    raise exception 'invalid reply target';
+  end if;
   if (select count(*) from public.drawing_comments c
        where c.drawing_id = new.drawing_id and c.author = new.author) >= 30 then
     raise exception 'comment limit reached';
@@ -540,8 +551,195 @@ create trigger drawing_comments_guard
   for each row execute function public.guard_comment();
 
 
+-- ── 5b. 通知（有人回覆你的留言、有人戳你）───────────────────────────
+--  • 用戶端只能讀自己的通知、把 read_at 標成已讀、刪除；「不能」自己新增通知。
+--  • 通知只會由資料庫裡 security definer 的程式建立：
+--      - 留言觸發器（回覆別人的留言 → 通知被回覆的人，回覆自己不通知）
+--      - poke_friend()（戳好友）
+--  • 超過 30 天的通知由 purge_expired() 清掉。
+create table if not exists public.notifications (
+  id         uuid primary key default gen_random_uuid(),
+  recipient  uuid not null references public.profiles (id) on delete cascade,
+  actor      uuid not null references public.profiles (id) on delete cascade,
+  kind       text not null check (kind in ('reply', 'poke')),
+  drawing_id uuid,
+  comment_id uuid,
+  created_at timestamptz not null default now(),
+  read_at    timestamptz
+);
+
+create index if not exists notifications_recipient_idx on public.notifications (recipient, created_at desc);
+
+alter table public.notifications enable row level security;
+
+drop policy if exists "notifications: read own" on public.notifications;
+create policy "notifications: read own" on public.notifications
+  for select to authenticated using (recipient = (select auth.uid()));
+
+drop policy if exists "notifications: update own" on public.notifications;
+create policy "notifications: update own" on public.notifications
+  for update to authenticated
+  using (recipient = (select auth.uid()))
+  with check (recipient = (select auth.uid()));
+
+drop policy if exists "notifications: delete own" on public.notifications;
+create policy "notifications: delete own" on public.notifications
+  for delete to authenticated using (recipient = (select auth.uid()));
+
+-- 刻意沒有 insert policy，也不給 insert 權限
+revoke all on public.notifications from public, anon, authenticated;
+grant select, delete on public.notifications to authenticated;
+grant update (read_at) on public.notifications to authenticated;   -- 只能改已讀時間，不能改收件人或種類
+
+-- 有人回覆留言 → 通知被回覆的人（回覆自己不通知）
+create or replace function public.notify_comment_reply()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  parent_author uuid;
+begin
+  if new.reply_to is null then
+    return new;
+  end if;
+  select c.author into parent_author from public.drawing_comments c where c.id = new.reply_to;
+  if parent_author is not null and parent_author <> new.author then
+    insert into public.notifications (recipient, actor, kind, drawing_id, comment_id)
+    values (parent_author, new.author, 'reply', new.drawing_id, new.id);
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.notify_comment_reply() from public, anon;
+
+drop trigger if exists drawing_comments_notify on public.drawing_comments;
+create trigger drawing_comments_notify
+  after insert on public.drawing_comments
+  for each row execute function public.notify_comment_reply();
+
+-- 戳好友的紀錄：只用來做頻率限制（收件人刪掉通知也不影響）。沒有任何人（除了函式）能讀寫。
+create table if not exists public.poke_log (
+  actor      uuid not null references public.profiles (id) on delete cascade,
+  recipient  uuid not null references public.profiles (id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+create index if not exists poke_log_pair_idx on public.poke_log (actor, recipient, created_at desc);
+alter table public.poke_log enable row level security;
+revoke all on public.poke_log from public, anon, authenticated;
+
+-- 戳好友：只能戳「已經是好友」的人；同一對人 12 小時內最多戳一次。
+-- 回傳 'ok' | 'not_friends' | 'too_soon'
+create or replace function public.poke_friend(target uuid)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  me uuid := auth.uid();
+begin
+  if me is null then
+    raise exception 'not signed in';
+  end if;
+  if target is null or target = me then
+    return 'not_friends';
+  end if;
+  if not exists (
+    select 1 from public.friendships f
+     where f.status = 'accepted'
+       and ((f.requester = me and f.addressee = target) or (f.requester = target and f.addressee = me))
+  ) then
+    return 'not_friends';
+  end if;
+  -- 同一對人同時戳也只算一次
+  perform pg_advisory_xact_lock(hashtextextended(me::text || ':' || target::text, 0));
+  if exists (
+    select 1 from public.poke_log l
+     where l.actor = me and l.recipient = target
+       and l.created_at > now() - interval '12 hours'
+  ) then
+    return 'too_soon';
+  end if;
+  insert into public.poke_log (actor, recipient) values (me, target);
+  insert into public.notifications (recipient, actor, kind) values (target, me, 'poke');
+  return 'ok';
+end;
+$$;
+
+revoke execute on function public.poke_friend(uuid) from public, anon;
+grant execute on function public.poke_friend(uuid) to authenticated;
+
+
+-- ── 5c. 許願池 ──────────────────────────────────────────────────
+--  • 使用者可以許願新功能（最多 500 字）；只有許願的人自己看得到、刪得掉自己的願望。
+--  • 24 小時內每人最多 10 個願望。
+--  • 網站管理員：Dashboard → Table Editor → wishes，
+--    或在 SQL Editor 執行  select * from wishes_with_author order by created_at desc;
+create table if not exists public.wishes (
+  id         uuid primary key default gen_random_uuid(),
+  author     uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  body       text not null check (char_length(btrim(body)) between 1 and 500),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists wishes_author_idx on public.wishes (author, created_at desc);
+
+alter table public.wishes enable row level security;
+
+drop policy if exists "wishes: insert own" on public.wishes;
+create policy "wishes: insert own" on public.wishes
+  for insert to authenticated with check (author = (select auth.uid()));
+
+drop policy if exists "wishes: read own" on public.wishes;
+create policy "wishes: read own" on public.wishes
+  for select to authenticated using (author = (select auth.uid()));
+
+drop policy if exists "wishes: delete own" on public.wishes;
+create policy "wishes: delete own" on public.wishes
+  for delete to authenticated using (author = (select auth.uid()));
+
+revoke all on public.wishes from public, anon, authenticated;
+grant select, insert, delete on public.wishes to authenticated;   -- 沒有 update
+
+create or replace function public.guard_wish()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  new.body := btrim(new.body);
+  new.created_at := now();
+  if (select count(*) from public.wishes w
+       where w.author = new.author and w.created_at > now() - interval '24 hours') >= 10 then
+    raise exception 'wish limit reached';
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.guard_wish() from public, anon;
+
+drop trigger if exists wishes_guard on public.wishes;
+create trigger wishes_guard
+  before insert on public.wishes
+  for each row execute function public.guard_wish();
+
+-- 給網站管理員看的檢視（附上許願的人）。只有 Dashboard／service role（資料庫擁有者）讀得到，
+-- App 的使用者（anon、authenticated）完全不能讀。
+create or replace view public.wishes_with_author as
+  select w.id, w.created_at, w.body, p.username, p.display_name, w.author
+    from public.wishes w
+    left join public.profiles p on p.id = w.author;
+
+revoke all on public.wishes_with_author from public, anon, authenticated;
+
+
 -- ── 6. 自動清除過期資料 ──────────────────────────────────────────
--- 只清畫與當天文字；留言（drawing_comments）刻意不清，畫的主人要永遠看得到。
+-- 只清畫、當天文字與 30 天前的通知；留言（drawing_comments）刻意不清，畫的主人要永遠看得到。
 create or replace function public.purge_expired()
 returns integer
 language plpgsql
@@ -556,6 +754,8 @@ begin
   get diagnostics n = row_count;
   delete from public.day_notes where expires_at <= now();
   get diagnostics m = row_count;
+  delete from public.notifications where created_at < now() - interval '30 days';
+  delete from public.poke_log where created_at < now() - interval '2 days';
   return n + m;
 end;
 $$;

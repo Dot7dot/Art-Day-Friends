@@ -65,3 +65,15 @@ export function formatTime(ts) {
 export function monthKey(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
 }
+
+/** 「剛剛」「5 分鐘前」「3 小時前」，超過一天就顯示日期（例如 3/14 09:30） */
+export function formatAgo(ts, now = Date.now()) {
+  const t = new Date(ts).getTime();
+  if (!Number.isFinite(t)) return '';
+  const mins = Math.floor((now - t) / 60000);
+  if (mins < 1) return '剛剛';
+  if (mins < 60) return `${mins} 分鐘前`;
+  if (mins < 60 * 24) return `${Math.floor(mins / 60)} 小時前`;
+  const d = new Date(t);
+  return `${d.getMonth() + 1}/${d.getDate()} ${formatTime(t)}`;
+}

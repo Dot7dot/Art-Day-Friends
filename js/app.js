@@ -5,11 +5,11 @@ import { SUPABASE_URL, SUPABASE_ANON_KEY, MAX_CLOUD_DRAWINGS_PER_DAY as CLOUD_MA
 import * as archive from './archive.js';
 import { processImage, cloudCopy, makeThumb, dataURLToBlob, makeAvatar } from './imaging.js';
 import { icon } from './icons.js';
-import { dayKey, addDays, endOfDay, dayParts, formatDayLong, timeLeftToday, formatTime } from './dates.js';
+import { dayKey, addDays, endOfDay, dayParts, formatDayLong, formatDayShort, timeLeftToday, formatTime, formatAgo } from './dates.js';
 import { esc, toast, openModal, confirmDialog, avatar, uuid, debounce, copyText, downloadBlob, setBusy } from './ui.js';
 import { openSketchPad } from './sketch.js';
 import { ANIMALS, checkRecoveryInput, SCHOOL_MAX, MSG as RECOVERY_MSG } from './recovery.js';
-import { openDrawingModal, commentHtml } from './drawing-modal.js';
+import { openDrawingModal, commentHtml, replyTarget } from './drawing-modal.js';
 import { cameraMode, openCameraModal } from './camera.js';
 import { isIOS, isAndroid, isMobileDevice, isStandalone, albumName, toFile, saveToAlbum, savedMessage, canShareFiles, downloadFiles, getAutoSave, setAutoSave, requestPersistOnce } from './album.js';
 
@@ -24,6 +24,10 @@ const state = {
   calMonth: null,
   selDay: null, // 日曆下方顯示哪一天；null = 今天
   incoming: 0,
+  unread: 0,       // 沒讀的通知（戳 + 回覆），顯示在「我的」
+  notifOk: null,   // 資料庫有通知功能嗎（null = 還不知道，false = 還沒更新 schema.sql）
+  badgeFor: null,
+  poked: new Map(), // 這次使用期間已經戳過的人 → 時間（毫秒）
   maintainedDay: null,
 };
 
@@ -125,6 +129,7 @@ async function boot() {
   });
   window.addEventListener('hashchange', render);
   setInterval(checkDayChange, 30_000);
+  setInterval(() => { if (state.me && !document.hidden) refreshBadge(true); }, 60_000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) checkDayChange(); });
   render();
 }
@@ -231,7 +236,7 @@ function brandMark(size = 30) {
 function navItem(key, label, ico, active) {
   const on = key === active;
   return `<a class="nav-item ${on ? 'on' : ''}" href="#/${key}" ${on ? 'aria-current="page"' : ''}>
-    <span class="nav-ico">${icon(ico)}${key === 'friends' ? '<span class="nav-badge" data-badge hidden></span>' : ''}</span>
+    <span class="nav-ico">${icon(ico)}${key === 'friends' ? '<span class="nav-badge" data-badge hidden></span>' : ''}${key === 'me' ? '<span class="nav-badge" data-badge-me hidden></span>' : ''}</span>
     <span class="nav-label">${label}</span>
   </a>`;
 }
@@ -274,11 +279,25 @@ function showCloudHelp() {
 }
 
 let badgeAt = 0;
+let badgeInflight = null;
 async function refreshBadge(force = false) {
-  if (!state.me) return;
-  if (force || Date.now() - badgeAt > 60_000) {
+  const me = state.me;
+  if (!me) return;
+  if (state.badgeFor !== me.id) { // 換了帳號：從頭來過
+    Object.assign(state, { badgeFor: me.id, incoming: 0, unread: 0, notifOk: null });
+    state.poked = new Map();
+    badgeAt = 0;
+  }
+  if (badgeInflight) await badgeInflight; // 已經在查了：等同一次結果
+  else if (force || Date.now() - badgeAt > 60_000) {
     badgeAt = Date.now();
-    try { state.incoming = (await state.backend.listFriendships()).incoming.length; } catch { /* 忽略 */ }
+    badgeInflight = Promise.all([
+      state.backend.listFriendships().then((f) => { state.incoming = f.incoming.length; }).catch(() => { /* 忽略 */ }),
+      state.notifOk === false ? null : state.backend.unreadNotificationCount().then((n) => { state.unread = n; state.notifOk = true; }).catch((e) => {
+        if (e?.code === 'FEATURE_UNSUPPORTED') { state.notifOk = false; state.unread = 0; } // 還沒更新 schema.sql：不顯示、也不再查
+      }),
+    ]).finally(() => { badgeInflight = null; });
+    await badgeInflight;
   }
   applyBadge();
 }
@@ -287,6 +306,11 @@ function applyBadge() {
   $$('[data-badge]').forEach((b) => {
     b.textContent = state.incoming > 9 ? '9+' : String(state.incoming);
     b.hidden = !state.incoming;
+  });
+  const onMe = parseRoute().name === 'me'; // 正在看「我的」：通知都在眼前，不再顯示
+  $$('[data-badge-me]').forEach((b) => {
+    b.textContent = state.unread > 9 ? '9+' : String(state.unread);
+    b.hidden = !state.unread || onMe;
   });
 }
 
@@ -775,8 +799,8 @@ function commentActions(mine) {
   const me = state.me;
   return {
     load: (id) => loadComments([id], { mine }),
-    async add(id, body) {
-      const c = await state.backend.addComment(id, body);
+    async add(id, body, replyTo = null) {
+      const c = await state.backend.addComment(id, body, replyTo);
       if (mine) archive.putComment(me.id, c).catch((e) => console.warn(e));
       return c;
     },
@@ -1033,13 +1057,15 @@ async function viewFriends(el, c, sub) {
       <a href="#/friends" role="tab" class="${tab === 'feed' ? 'on' : ''}" aria-selected="${tab === 'feed'}">今日動態</a>
       <a href="#/friends/list" role="tab" class="${tab === 'list' ? 'on' : ''}" aria-selected="${tab === 'list'}">好友名單<span class="nav-badge inline" data-badge hidden></span></a>
     </div>
-    ${tab === 'feed' ? '<div id="mine-slot"></div><div id="reco-join-slot"></div>' : ''}
+    ${tab === 'feed' ? `${noticeHtml()}${wishPillHtml()}<div id="mine-slot"></div><div id="reco-join-slot"></div>` : ''}
     <div id="friends-body"><div class="loading">${spinner}<span>載入中…</span></div></div>`;
   applyBadge();
   const body = $('#friends-body', el);
   if (tab === 'feed') {
     const mine = mountMine($('#mine-slot', el), c);
     mine.photo = mountAddButton(el, c, mine);
+    mountPokeButton(el, c);
+    $('[data-wish-open]', el)?.addEventListener('click', openWishPool);
     mine.repaint();
     // 沒有重新整理按鈕：每次進來都會載入；回到這個分頁（或切回 App）時，超過 1 分鐘就再更新一次
     let loadedAt = Date.now();
@@ -1155,6 +1181,295 @@ function mountAddButton(el, c, mine) {
     });
   });
   return photo;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  首頁：注意事項、許願池、戳好友
+// ════════════════════════════════════════════════════════════════
+
+/** 黑底白字的「注意事項」 */
+function noticeHtml() {
+  return `<section class="notice" aria-label="注意事項">
+    <h2 class="notice-title">注意事項</h2>
+    <p class="notice-body">這是點點實驗室目前在開發的 App，歡迎邀請你的好朋友一起來測試。如果出了問題，點點會再想辦法修正，有任何問題可以直接詢問點點實驗室的 IG 帳號。</p>
+  </section>`;
+}
+
+function wishPillHtml() {
+  return `<div class="wish-row"><button type="button" class="wish-pill" data-wish-open aria-haspopup="dialog">${icon('star', 18)}<span>許願池</span></button></div>`;
+}
+
+const WISH_MAX = 500;
+const WISH_NOTE = '這裡是歡迎大家許願新功能的地方，點點會嘗試把它完成';
+
+const wishItemHtml = (w) => `<li class="wish-item">
+  <p class="wish-text">${esc(w.body)}</p>
+  <span class="muted small">${esc(`${new Date(w.createdAt).getMonth() + 1}/${new Date(w.createdAt).getDate()} ${formatTime(w.createdAt)}`)}</span>
+</li>`;
+
+/** 許願池：寫下想要的新功能；下面列出自己許過的願望（看不到別人的） */
+function openWishPool() {
+  const m = openModal({
+    title: '許願池',
+    className: 'modal-wish',
+    content: `
+      <p class="wish-note">${esc(WISH_NOTE)}</p>
+      <form class="wish-form" autocomplete="off">
+        <textarea name="body" rows="4" maxlength="${WISH_MAX}" placeholder="例如：我想要可以…" aria-label="願望內容"></textarea>
+        <div class="wish-foot">
+          <span class="muted small" data-wish-count>0/${WISH_MAX}</span>
+          <button class="btn btn-primary" type="submit" disabled>${icon('star', 18)}<span>許願</span></button>
+        </div>
+      </form>
+      <section class="wish-history" aria-label="我的願望">
+        <h4>我的願望</h4>
+        <ul class="wish-list" aria-live="polite"><li class="loading">${spinner}<span>載入中…</span></li></ul>
+      </section>`,
+  });
+  const form = $('.wish-form', m.body);
+  const ta = form.elements.body;
+  const btn = $('button[type="submit"]', form);
+  const countEl = $('[data-wish-count]', m.body);
+  const list = $('.wish-list', m.body);
+  let wishes = [];
+  let supported = true;
+
+  const refresh = () => {
+    const n = [...ta.value.trim()].length;
+    btn.disabled = !n || !supported;
+    countEl.textContent = `${ta.value.length}/${WISH_MAX}`;
+  };
+  const paint = () => {
+    list.innerHTML = wishes.length ? wishes.map(wishItemHtml).join('') : '<li class="wish-empty muted small">還沒有願望，說說你想要什麼功能吧</li>';
+  };
+  const unsupported = (msg) => {
+    supported = false;
+    ta.disabled = true;
+    list.innerHTML = `<li class="wish-empty muted small">${esc(msg)}</li>`;
+    refresh();
+  };
+  ta.addEventListener('input', refresh);
+
+  state.backend.listWishes().then((w) => { wishes = w; paint(); }).catch((e) => {
+    console.warn(e);
+    if (e?.code === 'FEATURE_UNSUPPORTED') unsupported(e.message);
+    else list.innerHTML = '<li class="wish-empty muted small">願望暫時載入不到，晚點再試試</li>';
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const body = ta.value.trim();
+    if (!body || !supported) return;
+    setBusy(btn, true);
+    try {
+      const w = await state.backend.addWish(body);
+      wishes = [w, ...wishes];
+      ta.value = '';
+      paint();
+      toast('願望收到了，謝謝你！');
+    } catch (err) {
+      console.warn(err);
+      if (err?.code === 'FEATURE_UNSUPPORTED') unsupported(err.message);
+      else toast(err.message || '許願失敗', 'error');
+    }
+    setBusy(btn, false);
+    refresh();
+  });
+  refresh();
+  return m;
+}
+
+/** 首頁「＋」上方的小按鈕：戳好友，督促他畫圖 */
+function mountPokeButton(el, c) {
+  el.insertAdjacentHTML('beforeend', `
+    <button class="fab fab-sm" type="button" data-fab-poke aria-label="戳好友" aria-haspopup="dialog">${icon('pokePen', 24)}</button>`);
+  const btn = $('[data-fab-poke]', el);
+  btn.hidden = state.notifOk === false; // 資料庫還沒更新就先不顯示
+  refreshBadge().then(() => { if (c.alive && state.notifOk === false) btn.hidden = true; });
+  btn.addEventListener('click', () => openPokeSheet(btn));
+}
+
+const POKE_COOLDOWN = 12 * 36e5;
+const pokedRecently = (id) => Date.now() - (state.poked.get(id) || 0) < POKE_COOLDOWN;
+
+const pokeRowHtml = (p, done) => `<li class="person poke-row" data-poke-row="${esc(p.profile.id)}">
+  ${avatar(p.profile, 42)}
+  <div class="person-name">
+    <b>${esc(p.profile.displayName)}</b>
+    <span class="muted small">@${esc(p.profile.username)}</span>
+  </div>
+  ${p.posted ? '<span class="tag tag-small">今天畫了</span>' : ''}
+  <button type="button" class="btn btn-small poke-btn" data-poke="${esc(p.profile.id)}" ${done ? 'disabled' : ''}>${done ? '已戳' : '戳一下'}</button>
+</li>`;
+
+/** 戳好友：列出好友，按「戳一下」送出通知（同一位 12 小時內一次） */
+async function openPokeSheet(fab) {
+  const m = openModal({
+    title: '戳好友',
+    className: 'modal-small',
+    content: `<p class="muted small sheet-sub">戳你的好友，督促他畫圖</p>
+      <ul class="people poke-list"><li class="loading">${spinner}<span>載入中…</span></li></ul>`,
+  });
+  const ul = $('.poke-list', m.body);
+  let friends = [];
+  try {
+    const posts = await state.backend.fetchFriendsToday();
+    friends = posts.map((p) => ({ profile: p.profile, posted: !!(p.drawings.length || p.note) }))
+      .sort((a, b) => Number(a.posted) - Number(b.posted) || a.profile.displayName.localeCompare(b.profile.displayName, 'zh-Hant'));
+  } catch (e) {
+    console.warn(e);
+    ul.innerHTML = `<li class="wish-empty muted small">${esc(e.message || '好友名單暫時載入不到')}</li>`;
+    return;
+  }
+  ul.innerHTML = friends.length
+    ? friends.map((p) => pokeRowHtml(p, pokedRecently(p.profile.id))).join('')
+    : `<li class="empty compact poke-empty"><h2>還沒有好友</h2><p class="muted small">加好友之後，就能戳他督促畫圖。</p>
+        <a class="btn btn-small btn-primary" href="#/friends/list" data-close>${icon('userPlus', 16)}<span>加好友</span></a></li>`;
+
+  ul.addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-poke]');
+    if (!b || b.disabled) return;
+    const p = friends.find((x) => x.profile.id === b.dataset.poke);
+    if (!p) return;
+    const name = `@${p.profile.username}`;
+    setBusy(b, true);
+    let done = false;
+    try {
+      const r = await state.backend.pokeFriend(p.profile.id);
+      if (r === 'ok') { state.poked.set(p.profile.id, Date.now()); done = true; toast(`已經戳了 ${name}！`); }
+      else if (r === 'too_soon') { state.poked.set(p.profile.id, Date.now()); done = true; toast(`今天已經戳過 ${name} 了，晚點再戳吧`); }
+      else toast('你們還不是好友，不能戳他', 'error');
+    } catch (err) {
+      console.warn(err);
+      if (err?.code === 'FEATURE_UNSUPPORTED') {
+        state.notifOk = false;
+        if (fab) fab.hidden = true;
+        m.close(true);
+      }
+      toast(err.message || '戳好友失敗', 'error');
+    }
+    setBusy(b, false);
+    if (done) { b.disabled = true; b.textContent = '已戳'; }
+  });
+  return m;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  「我的」最上面：誰戳了你、通知（有人回覆你的留言）
+// ════════════════════════════════════════════════════════════════
+
+const nameOf = (p) => `@${p.username || p.displayName}`;
+
+/** 通知區的 HTML。unread = 打開頁面當下還沒讀的通知 id（讀過的不再強調） */
+function notificationsHtml(list, expanded = false) {
+  const now = Date.now();
+  const pokes = list.filter((n) => n.kind === 'poke' && (!n.readAt || now - Date.parse(n.createdAt) < 864e5));
+  const replies = list.filter((n) => n.kind === 'reply');
+  const unreadPokes = pokes.filter((n) => !n.readAt);
+  let html = '';
+
+  if (pokes.length) {
+    const actors = [];
+    for (const n of unreadPokes) if (!actors.some((a) => a.id === n.actor.id)) actors.push(n.actor);
+    const names = actors.length > 3 ? `${actors.slice(0, 3).map(nameOf).map(esc).join('、')} 等 ${actors.length} 人` : actors.map(nameOf).map(esc).join('、');
+    html += `<section class="notif-block poke-block" aria-label="誰戳了你">
+      <h2 class="notif-title">${icon('pokePen', 22)}<span>誰戳了你</span>${unreadPokes.length ? `<span class="count-pill">${unreadPokes.length}</span>` : ''}</h2>
+      <div class="card poke-card ${unreadPokes.length ? 'unread' : ''}">
+        ${unreadPokes.length ? `<div class="poke-hero">
+          <div class="avatar-stack">${actors.slice(0, 4).map((a) => avatar(a, 40)).join('')}</div>
+          <p class="poke-line"><b>${names}</b> 戳了你，叫你快去畫圖！</p>
+        </div>
+        <button type="button" class="btn btn-primary btn-block" data-go-draw>${icon('pen', 18)}<span>去畫畫</span></button>` : ''}
+        ${(unreadPokes.length ? pokes.filter((n) => n.readAt) : pokes).length ? `<ul class="people notif-rows">
+          ${(unreadPokes.length ? pokes.filter((n) => n.readAt) : pokes).slice(0, 5).map((n) => `<li class="person notif-row ${n.readAt ? '' : 'unread'}">
+            ${avatar(n.actor, 36)}
+            <div class="person-name"><b>${esc(n.actor.displayName)}</b><span class="muted small">${esc(nameOf(n.actor))} 戳了你</span></div>
+            <span class="muted small notif-time">${esc(formatAgo(n.createdAt))}</span>
+          </li>`).join('')}
+        </ul>` : ''}
+      </div>
+    </section>`;
+  }
+
+  if (replies.length) {
+    const shown = expanded ? replies : replies.slice(0, 5);
+    html += `<section class="notif-block" aria-label="通知">
+      <h2 class="notif-title">${icon('bell', 22)}<span>通知</span></h2>
+      <div class="card notif-card">
+        <ul class="notif-list">
+          ${shown.map((n) => `<li><button type="button" class="notif-item ${n.readAt ? '' : 'unread'}" data-notif-open="${esc(n.id)}">
+            ${avatar(n.actor, 36)}
+            <span class="notif-main">
+              <span class="notif-text"><b>${esc(nameOf(n.actor))}</b> 回覆了你的留言</span>
+              ${n.excerpt ? `<span class="notif-excerpt">${esc(n.excerpt)}</span>` : ''}
+              <span class="muted small">${esc(formatAgo(n.createdAt))}</span>
+            </span>
+          </button></li>`).join('')}
+        </ul>
+        ${replies.length > shown.length ? `<button type="button" class="btn btn-small btn-ghost notif-more" data-notif-more>顯示更多（${replies.length - shown.length}）</button>` : ''}
+      </div>
+    </section>`;
+  }
+  return html;
+}
+
+/** 打開通知對應的那張畫（自己的畫從本機找，好友的畫要還看得到）；看不到就提示 */
+async function openNotificationDrawing(n) {
+  const me = state.me;
+  const gone = () => toast('這張畫已經不在了，只有今天的畫看得到');
+  if (!n.drawingId) { gone(); return; }
+  let rec = null;
+  try { rec = await archive.getDrawing(n.drawingId); } catch { /* 找不到就當作不是自己的 */ }
+  if (rec && rec.userId === me.id) {
+    const url = URL.createObjectURL(rec.blob);
+    const when = rec.day === state.today ? '今天' : formatDayShort(rec.day);
+    openDrawingModal({
+      title: `${me.displayName} · ${when} ${formatTime(rec.createdAt)}`,
+      src: url,
+      alt: '我的畫',
+      drawingId: rec.id,
+      me,
+      isOwner: true,
+      readOnly: rec.day < state.today,
+      actions: commentActions(true),
+      onClose: () => setTimeout(() => URL.revokeObjectURL(url), 1000),
+      onSave: () => saveDrawingsToAlbum([{ blob: rec.blob, day: rec.day, n: 1 }]),
+      onDownload: () => downloadBlob(rec.blob, `art-day-${rec.day}-${formatTime(rec.createdAt).replace(':', '')}.jpg`),
+    });
+    return;
+  }
+  let image;
+  try { image = await state.backend.fetchDrawingImage(n.drawingId); } catch (e) { console.warn(e); gone(); return; }
+  openDrawingModal({
+    title: '好友的畫 · 今天',
+    src: image,
+    alt: '好友今天的畫',
+    drawingId: n.drawingId,
+    me,
+    isOwner: false,
+    actions: commentActions(false),
+  });
+}
+
+/** 把通知區畫進 slot，並標成已讀（打開「我的」就算讀過；這一次畫面上仍強調沒讀的） */
+function mountNotifications(slot, c, list) {
+  if (!slot || !list?.length) return;
+  let expanded = false;
+  const paint = () => { slot.innerHTML = notificationsHtml(list, expanded); };
+  paint();
+  slot.addEventListener('click', (e) => {
+    if (e.target.closest('[data-go-draw]')) { location.hash = '#/calendar'; return; }
+    if (e.target.closest('[data-notif-more]')) { expanded = true; paint(); return; }
+    const b = e.target.closest('[data-notif-open]');
+    if (!b) return;
+    const n = list.find((x) => x.id === b.dataset.notifOpen);
+    if (n) openNotificationDrawing(n).catch((err) => { console.warn(err); toast('開啟失敗', 'error'); });
+  });
+  if (list.some((n) => !n.readAt)) {
+    state.unread = 0;
+    applyBadge();
+    state.backend.markNotificationsRead().catch((e) => console.warn('mark read failed', e));
+  }
 }
 
 /**
@@ -1880,7 +2195,7 @@ function mountPastDay(el, c, day, list, note, { onBack, onData }) {
     if (!c.alive) return;
     for (const ul of el.querySelectorAll('[data-cmts]')) {
       const mine = all.filter((x) => x.drawingId === ul.dataset.cmts);
-      ul.innerHTML = mine.map((x) => commentHtml(x, { compact: true })).join('');
+      ul.innerHTML = mine.map((x) => commentHtml(x, { compact: true, replyTo: replyTarget(mine, x) })).join('');
       ul.hidden = !mine.length;
     }
   };
@@ -2034,11 +2349,16 @@ function openAlbumSaver(items) {
 
 async function viewMe(el, c) {
   const me = state.me;
-  const [act, est, persisted, recovery] = await Promise.all([
+  const [act, est, persisted, recovery, notifs] = await Promise.all([
     archive.activity(me.id),
     navigator.storage?.estimate?.().catch(() => null),
     navigator.storage?.persisted?.().catch(() => false),
     state.backend.recoveryStatus().catch((e) => { console.warn(e); return { supported: false }; }),
+    // 通知（戳、回覆）：功能還沒開（schema.sql 沒更新）或暫時查不到，就當作沒有
+    state.notifOk === false ? [] : state.backend.listNotifications(30).catch((e) => {
+      if (e?.code === 'FEATURE_UNSUPPORTED') state.notifOk = false; else console.warn(e);
+      return [];
+    }),
   ]);
   if (!c.alive) return;
   const streak = streakOf(act.drawingDays, state.today);
@@ -2046,6 +2366,7 @@ async function viewMe(el, c) {
   const autoOn = getAutoSave(me.id);
 
   el.innerHTML = `
+    <div id="notif-slot" class="notif-slot"></div>
     <section class="card profile-card">
       <button class="avatar-edit" data-avatar aria-label="更換大頭貼">
         ${avatar(me, 72)}
@@ -2157,6 +2478,8 @@ async function viewMe(el, c) {
 
   const importInput = $('#import-input', el);
   const avatarInput = $('#avatar-input', el);
+
+  mountNotifications($('#notif-slot', el), c, notifs);
 
   // 安裝按鈕：beforeinstallprompt 可能在頁面打開之後才來，來了就更新
   const installSlot = $('[data-install-slot]', el);

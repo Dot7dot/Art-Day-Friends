@@ -22,6 +22,8 @@ const ERRORS = [
   [/database error saving new user/i, '註冊失敗：使用者 ID 可能已被使用'],
   [/daily cloud limit/i, '今天上傳到雲端的張數已達上限'],
   [/drawing is not live/i, '這張畫已經過了今天，不能再留言了'],
+  [/wish limit/i, '24 小時內最多許 10 個願望，明天再來許吧'],
+  [/invalid reply target|violates foreign key.*reply_to/i, '你要回覆的那則留言已經不見了'],
   [/comment limit/i, '你在這張畫上的留言已經太多了，先到這裡吧'],
   [/schema cache|does not exist|PGRST20[25]|42P01|42883/i, '雲端資料庫還沒設定完成：請先在 Supabase 執行 supabase/schema.sql'],
   [/invalid api key|no api key/i, '雲端金鑰不正確，請檢查 js/config.js'],
@@ -45,6 +47,16 @@ const isMissingFn = (e) => /PGRST20[25]|42883|42P01|schema cache|does not exist/
 const RECOVERY_UNSUPPORTED = Object.assign(new Error(MSG.unsupported), { code: 'RECOVERY_UNSUPPORTED' });
 
 const COMMENT_COLS = 'id, drawing_id, day, body, created_at, author';
+// 資料庫還沒更新（沒有 reply_to 欄位）時退回不含 reply_to 的欄位，並記住（本次使用期間）
+const COMMENT_COLS_REPLY = `${COMMENT_COLS}, reply_to`;
+
+// 資料表／欄位／函式還沒建立（還沒重新執行最新的 schema.sql）
+const isMissingSchema = (e) => !!e && (/^(42P01|42703|42883|PGRST202|PGRST204|PGRST205)$/.test(e.code || e.cause?.code || '')
+  || /schema cache|does not exist|could not find/i.test(e.message || e.cause?.message || ''));
+const FEATURE_UNSUPPORTED = (what) => Object.assign(
+  new Error(`${what}還沒開啟：請網站管理員到 Supabase SQL Editor 重新執行最新的 supabase/schema.sql`),
+  { code: 'FEATURE_UNSUPPORTED' },
+);
 const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
 
 // sharePublic：自己的檔案才會查這個欄位（別人的不查）。null = 資料庫還沒有這個欄位（還沒更新 schema.sql）
@@ -69,7 +81,7 @@ const AVATAR_UNSUPPORTED = Object.assign(
 );
 
 const mapComment = (r, author) => ({
-  id: r.id, drawingId: r.drawing_id, day: r.day, body: r.body, createdAt: r.created_at,
+  id: r.id, drawingId: r.drawing_id, day: r.day, body: r.body, createdAt: r.created_at, replyTo: r.reply_to || null,
   author: author || { id: r.author, username: '', displayName: '已離開的朋友' },
 });
 
@@ -79,6 +91,7 @@ export async function createSupabaseBackend(url, anonKey) {
     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storageKey: 'artday-auth' },
   });
 
+  let replyOk = true; // drawing_comments 有 reply_to 欄位嗎
   let me = null;
   let authBusy = false; // 自己正在登入／註冊時，不重複處理登入事件
   const imageCache = new Map();
@@ -359,8 +372,13 @@ export async function createSupabaseBackend(url, anonKey) {
       if (!ids.length) return [];
       const rows = [];
       for (const part of chunk(ids, 40)) {
-        rows.push(...check(await sb.from('drawing_comments').select(COMMENT_COLS)
-          .in('drawing_id', part).order('created_at').limit(1000)));
+        const query = (cols) => sb.from('drawing_comments').select(cols).in('drawing_id', part).order('created_at').limit(1000);
+        let res = await query(replyOk ? COMMENT_COLS_REPLY : COMMENT_COLS);
+        if (res.error && replyOk && isMissingSchema(res.error)) { // 還沒有 reply_to 欄位：照舊查詢
+          replyOk = false;
+          res = await query(COMMENT_COLS);
+        }
+        rows.push(...check(res));
       }
       const authorIds = [...new Set(rows.map((r) => r.author))];
       const byId = new Map();
@@ -370,11 +388,17 @@ export async function createSupabaseBackend(url, anonKey) {
       return rows.map((r) => mapComment(r, byId.get(r.author)));
     },
 
-    async addComment(drawingId, body) {
-      const { data, error } = await sb.from('drawing_comments').insert({ drawing_id: drawingId, body })
-        .select(COMMENT_COLS).single();
+    /** replyTo = 被回覆的留言 id（選填） */
+    async addComment(drawingId, body, replyTo = null) {
+      if (replyTo && !replyOk) throw FEATURE_UNSUPPORTED('回覆');
+      const row = { drawing_id: drawingId, body };
+      if (replyTo) row.reply_to = replyTo;
+      const { data, error } = await sb.from('drawing_comments').insert(row)
+        .select(replyOk ? COMMENT_COLS_REPLY : COMMENT_COLS).single();
       if (error) {
         if (error.code === '42501') throw Object.assign(new Error('只有好友可以在今天的畫上留言'), { cause: error });
+        if (replyTo && isMissingSchema(error)) { replyOk = false; throw FEATURE_UNSUPPORTED('回覆'); }
+        if (replyTo && error.code === '23503') throw Object.assign(new Error('你要回覆的那則留言已經不見了'), { cause: error });
         throw friendly(error);
       }
       return mapComment(data, me);
@@ -435,6 +459,66 @@ export async function createSupabaseBackend(url, anonKey) {
           lastAt: times[times.length - 1] || null,
         };
       });
+    },
+
+    // ── 許願池 ──
+
+    /** 我自己許過的願望（新到舊）；資料庫還沒更新時丟出 code 'FEATURE_UNSUPPORTED' */
+    async listWishes() {
+      const { data, error } = await sb.from('wishes').select('id, body, created_at').order('created_at', { ascending: false }).limit(50);
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('許願池') : friendly(error);
+      return (data || []).map((w) => ({ id: w.id, body: w.body, createdAt: w.created_at }));
+    },
+
+    async addWish(body) {
+      const { data, error } = await sb.from('wishes').insert({ body }).select('id, body, created_at').single();
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('許願池') : friendly(error);
+      return { id: data.id, body: data.body, createdAt: data.created_at };
+    },
+
+    // ── 通知與戳好友 ──
+
+    /** 還沒讀的通知數；資料庫還沒更新時丟出 code 'FEATURE_UNSUPPORTED' */
+    async unreadNotificationCount() {
+      const { count, error } = await sb.from('notifications').select('id', { count: 'exact', head: true }).is('read_at', null);
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('通知') : friendly(error);
+      return count || 0;
+    },
+
+    /** 我的通知（新到舊）：{ id, kind: 'reply'|'poke', actor, drawingId, commentId, createdAt, readAt, excerpt } */
+    async listNotifications(limit = 30) {
+      const { data, error } = await sb.from('notifications')
+        .select('id, kind, actor, drawing_id, comment_id, created_at, read_at').order('created_at', { ascending: false }).limit(limit);
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('通知') : friendly(error);
+      const rows = data || [];
+      if (!rows.length) return [];
+      const actorIds = [...new Set(rows.map((r) => r.actor))];
+      const profiles = await profileQuery((cols) => sb.from('profiles').select(cols).in('id', actorIds));
+      const byId = new Map(profiles.map((p) => [p.id, mapProfile(p)]));
+      // 回覆的內容（看不到或已刪除就沒有摘要）
+      const cids = [...new Set(rows.filter((r) => r.kind === 'reply' && r.comment_id).map((r) => r.comment_id))];
+      const bodies = new Map();
+      if (cids.length) {
+        const res = await sb.from('drawing_comments').select('id, body').in('id', cids);
+        if (!res.error) for (const c of res.data || []) bodies.set(c.id, c.body);
+      }
+      return rows.map((r) => ({
+        id: r.id, kind: r.kind, drawingId: r.drawing_id, commentId: r.comment_id, createdAt: r.created_at, readAt: r.read_at,
+        actor: byId.get(r.actor) || { id: r.actor, username: '', displayName: '已離開的朋友' },
+        excerpt: bodies.get(r.comment_id) || '',
+      }));
+    },
+
+    async markNotificationsRead() {
+      const { error } = await sb.from('notifications').update({ read_at: new Date().toISOString() }).is('read_at', null);
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('通知') : friendly(error);
+    },
+
+    /** 戳好友：回傳 'ok' | 'not_friends' | 'too_soon' */
+    async pokeFriend(targetId) {
+      const { data, error } = await sb.rpc('poke_friend', { target: targetId });
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('戳好友') : friendly(error);
+      return String(data);
     },
 
     /** 把自己「今天以前」的雲端副本刪掉，並順手清掉所有人已過期的資料 */

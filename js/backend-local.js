@@ -12,6 +12,10 @@ const K_SESSION = 'artday.demo.session';
 const K_FRIENDS = 'artday.demo.friendships';
 const K_RECOVERY_FAILS = 'artday.demo.recoveryFails'; // { 使用者id: [答錯的時間（毫秒）] }
 const K_CANNED = 'artday.demo.cannedComments'; // 示範好友已經留過言的畫（每張只留一次）
+const K_NOTIFS = 'artday.demo.notifications'; // 通知（有人回覆、有人戳）
+const K_WISHES = 'artday.demo.wishes'; // 許願池（只存在這台裝置）
+const K_POKE_LOG = 'artday.demo.pokeLog'; // 戳的紀錄（頻率限制用，收件人刪通知也不影響）
+const K_POKE_DAY = 'artday.demo.pokeDay'; // { 使用者id: 示範好友最近一次來戳的日期 }
 
 const DEMO_ARTISTS = [
   {
@@ -56,6 +60,10 @@ const CANNED_COMMENTS = [
 ];
 const COMMENT_MAX = 200;
 const COMMENT_CAP = 30;
+const WISH_MAX = 500;
+const WISH_CAP = 10;            // 24 小時內
+const POKE_COOLDOWN = 12 * 36e5; // 同一對人 12 小時內只能戳一次
+const NOTIF_KEEP = 30 * 864e5;
 
 const read = (k, fallback) => {
   try { return JSON.parse(localStorage.getItem(k)) ?? fallback; } catch { return fallback; }
@@ -127,8 +135,12 @@ export async function createLocalBackend() {
     }
   }
 
+  const notifs = () => read(K_NOTIFS, []);
+  const addNotif = (n) => write(K_NOTIFS, [...notifs(), { id: `n-${randomHex(8)}`, createdAt: nowIso(), readAt: null, ...n }]);
+
   async function purgeExpired() {
     const now = nowIso();
+    write(K_NOTIFS, notifs().filter((n) => Date.now() - Date.parse(n.createdAt) < NOTIF_KEEP));
     await run(cloud, ['drawings', 'notes'], 'readwrite', async ({ drawings, notes }) => {
       const [ds, ns] = await Promise.all([promisify(drawings.getAll()), promisify(notes.getAll())]);
       ds.filter((d) => d.expiresAt <= now).forEach((d) => drawings.delete(d.id));
@@ -141,7 +153,7 @@ export async function createLocalBackend() {
   const isFriend = (a, b) => friendships().some((f) => f.status === 'accepted'
     && ((f.requester === a && f.addressee === b) || (f.requester === b && f.addressee === a)));
   const pubComment = (c) => ({
-    id: c.id, drawingId: c.drawingId, day: c.day, body: c.body, createdAt: c.createdAt,
+    id: c.id, drawingId: c.drawingId, day: c.day, body: c.body, createdAt: c.createdAt, replyTo: c.replyTo || null,
     author: byId(c.author) || { id: c.author, username: '', displayName: '已離開的朋友' },
   });
   const putCloudComment = (c) => run(cloud, 'comments', 'readwrite', ({ comments }) => promisify(comments.put(c)));
@@ -162,6 +174,19 @@ export async function createLocalBackend() {
       });
     }
     write(K_CANNED, [...done]);
+  }
+
+  /** 示範：我的好友裡的示範畫家，每天第一次打開時會有一位來戳我（每天一次） */
+  function ensureDemoPoke() {
+    const day = dayKey();
+    const done = read(K_POKE_DAY, {});
+    if (done[me.id] === day) return;
+    const artists = DEMO_ARTISTS.filter((a) => isFriend(a.id, me.id));
+    if (!artists.length) return; // 還沒有示範好友：先不記，等加了好友再來戳
+    done[me.id] = day;
+    write(K_POKE_DAY, done);
+    const a = artists[hashStr(`${me.id}:${day}`) % artists.length];
+    addNotif({ recipient: me.id, actor: a.id, kind: 'poke', createdAt: new Date(Date.now() - 1000 * 60 * (3 + (hashStr(day) % 40))).toISOString() });
   }
 
   const api = {
@@ -434,7 +459,7 @@ export async function createLocalBackend() {
         .map(pubComment);
     },
 
-    async addComment(drawingId, body) {
+    async addComment(drawingId, body, replyTo = null) {
       body = String(body ?? '').trim();
       if (!body || body.length > COMMENT_MAX) throw new Error(`留言需要 1–${COMMENT_MAX} 個字`);
       const d = await getDrawing(drawingId);
@@ -442,15 +467,24 @@ export async function createLocalBackend() {
       if (d.userId !== me.id && !isFriend(d.userId, me.id)) throw new Error('只有好友可以在今天的畫上留言');
       const mine = await run(cloud, 'comments', 'readonly', ({ comments }) => promisify(comments.index('byDrawing').getAll(drawingId)));
       if (mine.filter((c) => c.author === me.id).length >= COMMENT_CAP) throw new Error('你在這張畫上的留言已經太多了，先到這裡吧');
-      const c = { id: `c-${randomHex(8)}`, drawingId, drawingOwner: d.userId, author: me.id, day: d.day, body, createdAt: nowIso() };
+      const parent = replyTo ? mine.find((c) => c.id === replyTo) : null; // 回覆的對象必須在同一張畫上
+      if (replyTo && !parent) throw new Error('你要回覆的那則留言已經不見了');
+      const c = { id: `c-${randomHex(8)}`, drawingId, drawingOwner: d.userId, author: me.id, day: d.day, body, createdAt: nowIso(), replyTo: parent ? parent.id : null };
       await putCloudComment(c);
+      // 回覆別人 → 通知對方（回覆自己不通知）
+      if (parent && parent.author !== me.id) addNotif({ recipient: parent.author, actor: me.id, kind: 'reply', drawingId, commentId: c.id });
       return pubComment(c);
     },
 
     async deleteComment(id) {
       await run(cloud, 'comments', 'readwrite', async ({ comments }) => {
         const c = await promisify(comments.get(id));
-        if (c && (c.author === me.id || c.drawingOwner === me.id)) comments.delete(id);
+        if (!c || !(c.author === me.id || c.drawingOwner === me.id)) return;
+        comments.delete(id);
+        // 回覆它的留言：回覆對象變成「沒有」（和雲端版 on delete set null 一樣）
+        for (const r of await promisify(comments.index('byDrawing').getAll(c.drawingId))) {
+          if (r.replyTo === id) comments.put({ ...r, replyTo: null });
+        }
       });
     },
 
@@ -502,6 +536,60 @@ export async function createLocalBackend() {
         });
       }
       return result;
+    },
+
+    // ── 許願池（只存在這台裝置）──
+
+    async listWishes() {
+      return read(K_WISHES, []).filter((w) => w.author === me.id)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .map(({ id, body, createdAt }) => ({ id, body, createdAt }));
+    },
+
+    async addWish(body) {
+      body = String(body ?? '').trim();
+      if (!body || body.length > WISH_MAX) throw new Error(`願望需要 1–${WISH_MAX} 個字`);
+      const all = read(K_WISHES, []);
+      if (all.filter((w) => w.author === me.id && Date.now() - Date.parse(w.createdAt) < 864e5).length >= WISH_CAP) {
+        throw new Error('24 小時內最多許 10 個願望，明天再來許吧');
+      }
+      const w = { id: `w-${randomHex(8)}`, author: me.id, body, createdAt: nowIso() };
+      write(K_WISHES, [...all, w]);
+      return { id: w.id, body: w.body, createdAt: w.createdAt };
+    },
+
+    // ── 通知與戳好友（規則同雲端版：同一對人 12 小時內只能戳一次）──
+
+    async unreadNotificationCount() {
+      ensureDemoPoke();
+      return notifs().filter((n) => n.recipient === me.id && !n.readAt).length;
+    },
+
+    async listNotifications(limit = 30) {
+      ensureDemoPoke();
+      const comments = await run(cloud, 'comments', 'readonly', ({ comments: store }) => promisify(store.getAll()));
+      return notifs().filter((n) => n.recipient === me.id)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .slice(0, limit)
+        .map((n) => ({
+          id: n.id, kind: n.kind, drawingId: n.drawingId || null, commentId: n.commentId || null, createdAt: n.createdAt, readAt: n.readAt,
+          actor: byId(n.actor) || { id: n.actor, username: '', displayName: '已離開的朋友' },
+          excerpt: comments.find((c) => c.id === n.commentId)?.body || '',
+        }));
+    },
+
+    async markNotificationsRead() {
+      const t = nowIso();
+      write(K_NOTIFS, notifs().map((n) => (n.recipient === me.id && !n.readAt ? { ...n, readAt: t } : n)));
+    },
+
+    async pokeFriend(targetId) {
+      if (!targetId || targetId === me.id || !isFriend(me.id, targetId)) return 'not_friends';
+      const log = read(K_POKE_LOG, []).filter((l) => Date.now() - Date.parse(l.createdAt) < 2 * 864e5);
+      if (log.some((l) => l.actor === me.id && l.recipient === targetId && Date.now() - Date.parse(l.createdAt) < POKE_COOLDOWN)) return 'too_soon';
+      write(K_POKE_LOG, [...log, { actor: me.id, recipient: targetId, createdAt: nowIso() }]);
+      addNotif({ recipient: targetId, actor: me.id, kind: 'poke' });
+      return 'ok';
     },
 
     async purgeMyPast() {
