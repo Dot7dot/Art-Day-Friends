@@ -937,6 +937,34 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
 .wish-pill:hover { background: var(--wash); }
 .wish-pill:active { transform: scale(.97); }
 
+/* 打氣區 */
+.wish-row { flex-wrap: wrap; gap: 8px; }
+.cheer-list .loading { padding: 20px 0; }
+.modal-cheer .wish-history { margin-top: 16px; padding-top: 4px; }
+.cheer-item { display: flex; gap: 10px; align-items: flex-start; padding: 12px 0; border-top: var(--lw) solid var(--line-soft); }
+.cheer-item:first-child { border-top: 0; }
+.cheer-main, .cheer-edit-form { flex: 1; min-width: 0; }
+.cheer-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; line-height: 1.4; }
+.cheer-meta b { font-size: 14px; overflow-wrap: anywhere; }
+.cheer-sub { display: flex; flex-wrap: wrap; gap: 0 8px; line-height: 1.5; }
+.cheer-sub span + span::before { content: "·"; margin-right: 8px; color: var(--line); }
+.cheer-edited { color: var(--orange-ink); font-weight: 700; }
+.cheer-text { margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); line-height: 1.6; }
+.cheer-actions { display: flex; gap: 4px; margin: 4px 0 0 -8px; }
+.cheer-act {
+  display: inline-flex; align-items: center; gap: 4px; min-height: 32px; padding: 0 8px; border: 0; background: none; cursor: pointer;
+  font-size: 13px; font-weight: 800; color: var(--muted); border-radius: var(--r-xs);
+}
+.cheer-act:hover { color: var(--orange-ink); background: var(--wash); }
+.cheer-act.danger:hover { color: var(--danger); background: var(--wash); }
+.cheer-edit-form { display: grid; gap: 8px; }
+.cheer-edit-form textarea {
+  display: block; width: 100%; min-height: 84px; resize: vertical; padding: 10px 12px;
+  border: var(--lw) solid var(--line); border-radius: var(--r-sm); background: var(--bg); outline: none; font-size: 16px; line-height: 1.6;
+}
+.cheer-edit-form textarea:focus { border-color: var(--orange); box-shadow: 0 0 0 4px rgba(242, 153, 74, .16); }
+.cheer-edit-btns { display: flex; gap: 6px; }
+
 .wish-note { color: var(--ink-2); font-size: 14.5px; line-height: 1.7; padding: 12px 14px; border-radius: var(--r-sm); background: var(--paper); border: var(--lw) solid var(--line-soft); }
 .wish-form { margin-top: 14px; display: grid; gap: 10px; }
 .wish-form textarea {

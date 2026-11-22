@@ -14,6 +14,8 @@ const K_RECOVERY_FAILS = 'artday.demo.recoveryFails'; // { 使用者id: [答錯�
 const K_CANNED = 'artday.demo.cannedComments'; // 示範好友已經留過言的畫（每張只留一次）
 const K_NOTIFS = 'artday.demo.notifications'; // 通知（有人回覆、有人戳）
 const K_WISHES = 'artday.demo.wishes'; // 許願池（只存在這台裝置）
+const K_CHEERS = 'artday.demo.cheers'; // 打氣區（只存在這台裝置，保留 3 天）
+const K_CHEERS_SEEDED = 'artday.demo.cheersSeeded';
 const K_POKE_LOG = 'artday.demo.pokeLog'; // 戳的紀錄（頻率限制用，收件人刪通知也不影響）
 const K_POKE_DAY = 'artday.demo.pokeDay'; // { 使用者id: 示範好友最近一次來戳的日期 }
 
@@ -62,6 +64,9 @@ const COMMENT_MAX = 200;
 const COMMENT_CAP = 30;
 const WISH_MAX = 500;
 const WISH_CAP = 10;            // 24 小時內
+const CHEER_MAX = 200;
+const CHEER_CAP = 20;           // 24 小時內
+const CHEER_KEEP = 3 * 864e5;   // 保留 3 天
 const POKE_COOLDOWN = 12 * 36e5; // 同一對人 12 小時內只能戳一次
 const NOTIF_KEEP = 30 * 864e5;
 
@@ -174,6 +179,28 @@ export async function createLocalBackend() {
       });
     }
     write(K_CANNED, [...done]);
+  }
+
+  const pubCheer = (c) => ({
+    id: c.id, body: c.body, createdAt: c.createdAt, updatedAt: c.updatedAt || null, expiresAt: c.expiresAt,
+    author: byId(c.author) || { id: c.author, username: '', displayName: '已離開的朋友' },
+  });
+
+  /** 示範：第一次打開打氣區時，示範畫家先留幾句話，板子才不會空空的（只放一次） */
+  function seedCheers() {
+    if (localStorage.getItem(K_CHEERS_SEEDED)) return;
+    localStorage.setItem(K_CHEERS_SEEDED, '1');
+    const now = Date.now();
+    const mk = (author, body, agoMs) => ({
+      id: `demo-ch-${author}-${agoMs}`, author, body, updatedAt: null,
+      createdAt: new Date(now - agoMs).toISOString(), expiresAt: new Date(now - agoMs + CHEER_KEEP).toISOString(),
+    });
+    write(K_CHEERS, [
+      ...read(K_CHEERS, []),
+      mk('demo-momo', '今天也辛苦了，畫不出來也沒關係，休息一下再開始！', 25 * 60e3),
+      mk('demo-ashu', '每天畫一點點，就是很棒的事。大家加油！', 5 * 36e5),
+      mk('demo-kai', '先畫下去，線條歪歪的也很可愛。', 30 * 36e5),
+    ]);
   }
 
   /** 示範：我的好友裡的示範畫家，每天第一次打開時會有一位來戳我（每天一次） */
@@ -563,6 +590,44 @@ export async function createLocalBackend() {
       const w = { id: `w-${randomHex(8)}`, author: me.id, body, createdAt: nowIso() };
       write(K_WISHES, [...all, w]);
       return { id: w.id, body: w.body, createdAt: w.createdAt };
+    },
+
+    // ── 打氣區（只存在這台裝置；規則同雲端版：保留 3 天、只能改刪自己的、編輯不延長期限）──
+
+    async listCheers() {
+      seedCheers();
+      const now = Date.now();
+      return read(K_CHEERS, []).filter((c) => Date.parse(c.expiresAt) > now)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .map(pubCheer);
+    },
+
+    async addCheer(body) {
+      body = String(body ?? '').trim();
+      if (!body || body.length > CHEER_MAX) throw new Error(`打氣的話需要 1–${CHEER_MAX} 個字`);
+      const all = read(K_CHEERS, []);
+      if (all.filter((c) => c.author === me.id && Date.now() - Date.parse(c.createdAt) < 864e5).length >= CHEER_CAP) {
+        throw new Error('24 小時內最多留 20 則打氣，明天再來吧');
+      }
+      const c = { id: `ch-${randomHex(8)}`, author: me.id, body, createdAt: nowIso(), updatedAt: null, expiresAt: new Date(Date.now() + CHEER_KEEP).toISOString() };
+      write(K_CHEERS, [...all, c]);
+      return pubCheer(c);
+    },
+
+    async updateCheer(id, body) {
+      body = String(body ?? '').trim();
+      if (!body || body.length > CHEER_MAX) throw new Error(`打氣的話需要 1–${CHEER_MAX} 個字`);
+      const all = read(K_CHEERS, []);
+      const c = all.find((x) => x.id === id && x.author === me.id && Date.parse(x.expiresAt) > Date.now());
+      if (!c) throw new Error('這則打氣已經不見了（可能已過期或被刪除）');
+      c.body = body;
+      c.updatedAt = nowIso(); // expiresAt 不變
+      write(K_CHEERS, all);
+      return pubCheer(c);
+    },
+
+    async deleteCheer(id) {
+      write(K_CHEERS, read(K_CHEERS, []).filter((c) => !(c.id === id && c.author === me.id)));
     },
 
     // ── 通知與戳好友（規則同雲端版：同一對人 12 小時內只能戳一次）──

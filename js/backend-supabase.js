@@ -22,6 +22,7 @@ const ERRORS = [
   [/database error saving new user/i, '註冊失敗：使用者 ID 可能已被使用'],
   [/daily cloud limit/i, '今天上傳到雲端的張數已達上限'],
   [/drawing is not live/i, '這張畫已經過了今天，不能再留言了'],
+  [/cheer limit/i, '24 小時內最多留 20 則打氣，明天再來吧'],
   [/wish limit/i, '24 小時內最多許 10 個願望，明天再來許吧'],
   [/invalid reply target|violates foreign key.*reply_to/i, '你要回覆的那則留言已經不見了'],
   [/comment limit/i, '你在這張畫上的留言已經太多了，先到這裡吧'],
@@ -82,6 +83,12 @@ const AVATAR_UNSUPPORTED = Object.assign(
 
 const mapComment = (r, author) => ({
   id: r.id, drawingId: r.drawing_id, day: r.day, body: r.body, createdAt: r.created_at, replyTo: r.reply_to || null,
+  author: author || { id: r.author, username: '', displayName: '已離開的朋友' },
+});
+
+const CHEER_COLS = 'id, author, body, created_at, updated_at, expires_at';
+const mapCheer = (r, author) => ({
+  id: r.id, body: r.body, createdAt: r.created_at, updatedAt: r.updated_at || null, expiresAt: r.expires_at,
   author: author || { id: r.author, username: '', displayName: '已離開的朋友' },
 });
 
@@ -488,6 +495,40 @@ export async function createSupabaseBackend(url, anonKey) {
       const { data, error } = await sb.from('wishes').insert({ body }).select('id, body, created_at').single();
       if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('許願池') : friendly(error);
       return { id: data.id, body: data.body, createdAt: data.created_at };
+    },
+
+    // ── 打氣區（所有人的留言，保留 3 天）──
+
+    /** 最近 3 天、還沒過期的打氣留言（新到舊）；資料庫還沒更新時丟出 code 'FEATURE_UNSUPPORTED' */
+    async listCheers() {
+      const { data, error } = await sb.from('cheers').select(CHEER_COLS)
+        .gt('expires_at', new Date().toISOString()).order('created_at', { ascending: false }).limit(200);
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('打氣區') : friendly(error);
+      const rows = data || [];
+      const byId = new Map();
+      for (const part of chunk([...new Set(rows.map((r) => r.author))], 80)) {
+        for (const p of await profileQuery((cols) => sb.from('profiles').select(cols).in('id', part))) byId.set(p.id, mapProfile(p));
+      }
+      return rows.map((r) => mapCheer(r, byId.get(r.author)));
+    },
+
+    async addCheer(body) {
+      const { data, error } = await sb.from('cheers').insert({ body }).select(CHEER_COLS).single();
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('打氣區') : friendly(error);
+      return mapCheer(data, me);
+    },
+
+    /** 只送 body；期限（expires_at）由資料庫固定，編輯不會延長 */
+    async updateCheer(id, body) {
+      const { data, error } = await sb.from('cheers').update({ body }).eq('id', id).select(CHEER_COLS).maybeSingle();
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('打氣區') : friendly(error);
+      if (!data) throw new Error('這則打氣已經不見了（可能已過期或被刪除）');
+      return mapCheer(data, me);
+    },
+
+    async deleteCheer(id) {
+      const { error } = await sb.from('cheers').delete().eq('id', id);
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('打氣區') : friendly(error);
     },
 
     // ── 通知與戳好友 ──

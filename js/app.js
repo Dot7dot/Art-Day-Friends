@@ -1168,6 +1168,7 @@ async function viewFriends(el, c, sub) {
     mine.photo = mountAddButton(el, c, mine);
     mountPokeButton(el, c);
     $('[data-wish-open]', el)?.addEventListener('click', openWishPool);
+    $('[data-cheer-open]', el)?.addEventListener('click', openCheerBoard);
     mine.repaint();
     // 沒有重新整理按鈕：每次進來都會載入；回到這個分頁（或切回 App）時，超過 1 分鐘就再更新一次
     let loadedAt = Date.now();
@@ -1298,7 +1299,10 @@ function noticeHtml() {
 }
 
 function wishPillHtml() {
-  return `<div class="wish-row"><button type="button" class="wish-pill" data-wish-open aria-haspopup="dialog">${icon('star', 18)}<span>許願池</span></button></div>`;
+  return `<div class="wish-row">
+    <button type="button" class="wish-pill" data-wish-open aria-haspopup="dialog">${icon('star', 18)}<span>許願池</span></button>
+    <button type="button" class="wish-pill" data-cheer-open aria-haspopup="dialog">${icon('heart', 18)}<span>打氣區</span></button>
+  </div>`;
 }
 
 const WISH_MAX = 500;
@@ -1376,6 +1380,168 @@ function openWishPool() {
     }
     setBusy(btn, false);
     refresh();
+  });
+  refresh();
+  return m;
+}
+
+const CHEER_MAX = 200;
+const CHEER_NOTE = '打氣區是讓大家互相打氣的留言板，在這裡說些打氣的話吧！每則留言會保留 3 天。';
+
+/** 「剩 N 天」：以到期那天跟今天差幾個日曆日算；同一天就是「今天到期」 */
+function cheerLeft(expiresAt) {
+  const startOf = (t) => { const d = new Date(t); return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); };
+  const n = Math.round((startOf(expiresAt) - startOf(Date.now())) / 864e5);
+  return n <= 0 ? '今天到期' : `剩 ${n} 天`;
+}
+
+const cheerItemHtml = (c, mine) => `<li class="cheer-item" data-cheer="${esc(c.id)}">
+  ${avatar(c.author, 36)}
+  <div class="cheer-main">
+    <div class="cheer-meta">
+      <b>${esc(c.author.displayName)}</b>
+      ${c.author.username ? `<span class="muted small">@${esc(c.author.username)}</span>` : ''}
+    </div>
+    <div class="cheer-sub muted small">
+      <span>${esc(formatAgo(c.createdAt))}</span>${c.updatedAt ? '<span class="cheer-edited">已編輯</span>' : ''}<span>${esc(cheerLeft(c.expiresAt))}</span>
+    </div>
+    <p class="cheer-text">${esc(c.body)}</p>
+    ${mine ? `<div class="cheer-actions">
+      <button type="button" class="cheer-act" data-cheer-edit="${esc(c.id)}">${icon('edit', 14)}<span>編輯</span></button>
+      <button type="button" class="cheer-act danger" data-cheer-del="${esc(c.id)}">${icon('trash', 14)}<span>刪除</span></button>
+    </div>` : ''}
+  </div>
+</li>`;
+
+/** 打氣區：所有人的打氣留言板，每則保留 3 天；自己的可以編輯、刪除 */
+function openCheerBoard() {
+  const m = openModal({
+    title: '打氣區',
+    className: 'modal-wish modal-cheer',
+    content: `
+      <p class="wish-note">${esc(CHEER_NOTE)}</p>
+      <form class="wish-form" autocomplete="off">
+        <textarea name="body" rows="3" maxlength="${CHEER_MAX}" placeholder="寫一句給大家的打氣…" aria-label="打氣的話"></textarea>
+        <div class="wish-foot">
+          <span class="muted small" data-cheer-count>0/${CHEER_MAX}</span>
+          <button class="btn btn-primary" type="submit" disabled>${icon('heart', 18)}<span>送出</span></button>
+        </div>
+      </form>
+      <section class="wish-history" aria-label="大家的打氣">
+        <ul class="wish-list cheer-list" aria-live="polite"><li class="loading">${spinner}<span>載入中…</span></li></ul>
+      </section>`,
+  });
+  const form = $('.wish-form', m.body);
+  const ta = form.elements.body;
+  const btn = $('button[type="submit"]', form);
+  const countEl = $('[data-cheer-count]', m.body);
+  const list = $('.cheer-list', m.body);
+  const myId = state.me?.id;
+  let cheers = [];
+  let supported = true;
+  let editingId = null;
+
+  const refresh = () => {
+    btn.disabled = ![...ta.value.trim()].length || !supported;
+    countEl.textContent = `${ta.value.length}/${CHEER_MAX}`;
+  };
+  const note = (msg) => `<li class="wish-empty muted small">${esc(msg)}</li>`;
+  const editHtml = (c) => `<li class="cheer-item editing" data-cheer="${esc(c.id)}">
+    ${avatar(c.author, 36)}
+    <form class="cheer-edit-form" autocomplete="off">
+      <textarea name="body" rows="3" maxlength="${CHEER_MAX}" aria-label="編輯打氣的話">${esc(c.body)}</textarea>
+      <div class="wish-foot">
+        <span class="muted small" data-edit-count>${c.body.length}/${CHEER_MAX}</span>
+        <span class="cheer-edit-btns">
+          <button type="button" class="btn btn-ghost btn-small" data-edit-cancel>取消</button>
+          <button type="submit" class="btn btn-primary btn-small">儲存</button>
+        </span>
+      </div>
+    </form>
+  </li>`;
+  const paint = () => {
+    list.innerHTML = cheers.length
+      ? cheers.map((c) => (c.id === editingId ? editHtml(c) : cheerItemHtml(c, c.author.id === myId))).join('')
+      : note('還沒有人打氣，當第一個吧！');
+    if (editingId) {
+      const t = $('.cheer-edit-form textarea', list);
+      t?.focus();
+      t?.setSelectionRange(t.value.length, t.value.length);
+    }
+  };
+  const unsupported = () => {
+    supported = false;
+    ta.disabled = true;
+    list.innerHTML = note('打氣區還沒開放，請管理員更新資料庫');
+    refresh();
+  };
+  const fail = (err, fallback) => {
+    console.warn(err);
+    if (err?.code === 'FEATURE_UNSUPPORTED') unsupported();
+    else toast(err?.message || fallback, 'error');
+  };
+  ta.addEventListener('input', refresh);
+
+  // 每次打開都重新抓最新的
+  state.backend.listCheers().then((l) => { cheers = l; paint(); }).catch((e) => {
+    console.warn(e);
+    if (e?.code === 'FEATURE_UNSUPPORTED') unsupported();
+    else list.innerHTML = note('打氣暫時載入不到，晚點再試試');
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const body = ta.value.trim();
+    if (!body || !supported) return;
+    setBusy(btn, true);
+    try {
+      const c = await state.backend.addCheer(body);
+      cheers = [c, ...cheers];
+      ta.value = '';
+      paint();
+      toast('打氣送出去了！');
+    } catch (err) { fail(err, '送出失敗'); }
+    setBusy(btn, false);
+    refresh();
+  });
+
+  list.addEventListener('input', (e) => {
+    if (e.target.matches('.cheer-edit-form textarea')) $('[data-edit-count]', list).textContent = `${e.target.value.length}/${CHEER_MAX}`;
+  });
+  list.addEventListener('click', async (e) => {
+    const editBtn = e.target.closest('[data-cheer-edit]');
+    if (editBtn) { editingId = editBtn.dataset.cheerEdit; paint(); return; }
+    if (e.target.closest('[data-edit-cancel]')) { editingId = null; paint(); return; }
+    const delBtn = e.target.closest('[data-cheer-del]');
+    if (!delBtn) return;
+    const id = delBtn.dataset.cheerDel;
+    if (!(await confirmDialog('要刪除這則打氣嗎？刪除後就看不到了。', { title: '刪除打氣', ok: '刪除', danger: true }))) return;
+    try {
+      await state.backend.deleteCheer(id);
+      cheers = cheers.filter((c) => c.id !== id);
+      if (editingId === id) editingId = null;
+      paint();
+      toast('已刪除');
+    } catch (err) { fail(err, '刪除失敗'); }
+  });
+  list.addEventListener('submit', async (e) => {
+    const f = e.target.closest('.cheer-edit-form');
+    if (!f) return;
+    e.preventDefault();
+    const body = f.elements.body.value.trim();
+    if (!body) { toast('內容不能是空的', 'error'); return; }
+    const saveBtn = $('button[type="submit"]', f);
+    setBusy(saveBtn, true);
+    try {
+      const c = await state.backend.updateCheer(editingId, body);
+      cheers = cheers.map((x) => (x.id === c.id ? c : x));
+      editingId = null;
+      paint();
+      toast('已更新');
+    } catch (err) {
+      fail(err, '儲存失敗');
+      if (supported) setBusy(saveBtn, false);
+    }
   });
   refresh();
   return m;
