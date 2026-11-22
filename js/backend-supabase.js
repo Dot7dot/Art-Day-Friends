@@ -183,10 +183,15 @@ export async function createSupabaseBackend(url, anonKey) {
     async signIn({ login, password }) {
       authBusy = true;
       try {
-        // 一般輸入使用者 ID；含有 @ 的（例如早期用 email 註冊的帳號）就直接當 email 用
+        // 一般輸入使用者 ID；含有 @ 的就直接當 email 用（舊帳號已改成 ID 登入，失敗時會提示改用 ID）
         const id = login.trim().replace(/^@/, '');
         const email = id.includes('@') ? id : loginEmail(id);
-        const data = check(await sb.auth.signInWithPassword({ email, password }));
+        const res = await sb.auth.signInWithPassword({ email, password });
+        // 打了真實 email 卻登不進去：帳號已改成只用 ID 登入
+        if (res.error && id.includes('@') && /invalid login credentials/i.test(res.error.message || '')) {
+          throw Object.assign(new Error('現在請改用使用者 ID 登入（不用再輸入信箱）'), { cause: res.error, code: res.error.code });
+        }
+        const data = check(res);
         me = await loadProfile(data.user);
         return me;
       } finally { authBusy = false; }

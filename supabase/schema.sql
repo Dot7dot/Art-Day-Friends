@@ -1015,9 +1015,17 @@ grant execute on function public.reset_password_with_answers(text, text, text, t
 --   select public.admin_reset_password('momo_draws', '臨時密碼123');
 --
 -- admin_reset_password 同時會：把尚未確認的信箱標成已確認、清除「忘記密碼」答錯的紀錄（解除鎖定）、
--- 並讓舊的登入失效。注意：SQL Editor 會保留執行過的語句，臨時密碼用完就請對方改掉。
+-- 把登入信箱改成 ID 信箱（舊的真實信箱不再使用）、並讓舊的登入失效。
+-- 注意：SQL Editor 會保留執行過的語句，臨時密碼用完就請對方改掉。
+--
+--   -- 4. 把「早期用真實 email 註冊」的帳號一次全部改成用 ID 登入（密碼不變；不會自動執行，要自己呼叫）
+--   --    沒有任何資料列 = 全部都已經正常；可以重複執行
+--   select * from public.admin_migrate_email_logins();
 
-create or replace function public.admin_user_status(p_username text)
+-- 回傳欄位變了（多了 id_login_ok），所以要先 drop 再建立
+drop function if exists public.admin_user_status(text);
+
+create function public.admin_user_status(p_username text)
 returns table (
   username text,
   display_name text,
@@ -1028,7 +1036,8 @@ returns table (
   email_confirmed boolean,
   has_recovery_answers boolean,
   recovery_failures_24h integer,
-  recovery_locked boolean
+  recovery_locked boolean,
+  id_login_ok boolean
 )
 language sql
 security definer
@@ -1038,7 +1047,8 @@ as $$
          (u.email_confirmed_at is not null),
          exists (select 1 from public.recovery_answers r where r.user_id = p.id),
          f.n,
-         f.n >= 5
+         f.n >= 5,
+         (lower(u.email) = p.username || '@users.art-day.invalid')
     from public.profiles p
     left join auth.users u on u.id = p.id
     cross join lateral (
@@ -1078,6 +1088,103 @@ as $$
    limit 50;
 $$;
 
+-- 內部helper：把某個使用者的登入信箱改成「<ID>@users.art-day.invalid」，密碼不動。
+-- 回傳 'unchanged'（本來就正常）、'skipped: email in use'、或 'ok'；其他錯誤直接 raise。
+-- 呼叫者要自己用 begin/exception 包住。不能從網站呼叫（見最下面的 revoke）。
+create or replace function public.admin_fix_login_email(p_uid uuid, p_username text)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target text := lower(p_username) || '@users.art-day.invalid';
+  old_email text;
+begin
+  select u.email into old_email from auth.users u where u.id = p_uid;
+  if not found then
+    raise exception 'auth.users 裡找不到 %', p_uid;
+  end if;
+  if lower(coalesce(old_email, '')) = target then
+    return 'unchanged';
+  end if;
+  if exists (select 1 from auth.users x where lower(x.email) = target and x.id <> p_uid) then
+    return 'skipped: email in use';
+  end if;
+
+  update auth.users
+     set email = target,
+         email_confirmed_at = coalesce(email_confirmed_at, now()),
+         updated_at = now()
+   where id = p_uid;
+
+  -- 清掉還沒完成的「換信箱」請求（欄位不存在就略過）
+  begin update auth.users set email_change = '' where id = p_uid;
+  exception when undefined_column then null; end;
+  begin update auth.users set email_change_token_new = '' where id = p_uid;
+  exception when undefined_column then null; end;
+  begin update auth.users set email_change_token_current = '' where id = p_uid;
+  exception when undefined_column then null; end;
+  begin update auth.users set email_change_confirm_status = 0 where id = p_uid;
+  exception when undefined_column then null; end;
+
+  -- email 身分：identity_data 改成新信箱。
+  -- 注意 auth.identities.email 是 generated column，不能直接寫入，會跟著 identity_data 自動更新。
+  begin
+    update auth.identities
+       set identity_data = identity_data || jsonb_build_object('email', target, 'email_verified', true),
+           updated_at = now()
+     where user_id = p_uid and provider = 'email';
+  exception when undefined_table or undefined_column then null; end;
+  -- 舊格式的 provider_id 是信箱，新格式是 user id；舊格式的改成 user id
+  begin
+    update auth.identities
+       set provider_id = p_uid::text
+     where user_id = p_uid and provider = 'email'
+       and lower(provider_id) = lower(old_email);
+  exception when undefined_table or undefined_column then null; end;
+
+  -- 讓舊的登入失效（資料表不存在或沒權限時略過）
+  begin delete from auth.refresh_tokens where user_id = p_uid::text;
+  exception when others then null; end;
+  begin delete from auth.sessions where user_id = p_uid;
+  exception when others then null; end;
+
+  return 'ok';
+end;
+$$;
+
+create or replace function public.admin_migrate_email_logins()
+returns table (username text, old_email text, new_email text, result text)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  r record;
+  res text;
+begin
+  for r in
+    select p.id as uid, p.username as uname, u.email::text as email
+      from public.profiles p
+      join auth.users u on u.id = p.id
+     where lower(coalesce(u.email, '')) <> lower(p.username) || '@users.art-day.invalid'
+     order by p.username
+  loop
+    username := r.uname;
+    old_email := r.email;
+    new_email := lower(r.uname) || '@users.art-day.invalid';
+    begin
+      res := public.admin_fix_login_email(r.uid, r.uname);
+      result := case when res = 'unchanged' then 'ok' else res end;
+    exception when others then
+      result := 'error: ' || sqlerrm;
+    end;
+    return next;
+  end loop;
+end;
+$$;
+
 create or replace function public.admin_reset_password(p_username text, p_new_password text)
 returns text
 language plpgsql
@@ -1088,6 +1195,9 @@ declare
   uname text := lower(regexp_replace(btrim(coalesce(p_username, '')), '^@', ''));
   uid uuid;
   n integer;
+  old_email text;
+  fixed text;
+  note text := '';
 begin
   select p.id into uid from public.profiles p where p.username = uname;
   if uid is null then
@@ -1111,6 +1221,19 @@ begin
     raise exception '@% 有檔案，但 auth.users 裡找不到對應的帳號', uname;
   end if;
 
+  -- 把登入信箱也改成 ID 信箱（舊的真實信箱不再使用）
+  select u.email::text into old_email from auth.users u where u.id = uid;
+  begin
+    fixed := public.admin_fix_login_email(uid, uname);
+  exception when others then
+    fixed := 'error: ' || sqlerrm;
+  end;
+  if fixed = 'ok' then
+    note := ' (login switched from ' || coalesce(old_email, 'none') || ' to ID)';
+  elsif fixed <> 'unchanged' then
+    note := ' (WARNING: login email not changed - ' || fixed || ')';
+  end if;
+
   -- 清除「忘記密碼」答錯的紀錄（解除鎖定）
   begin
     delete from public.recovery_attempts where user_id = uid and not success;
@@ -1129,7 +1252,7 @@ begin
     null;
   end;
 
-  return 'ok: password reset for @' || uname;
+  return 'ok: password reset for @' || uname || note;
 end;
 $$;
 
@@ -1137,3 +1260,5 @@ $$;
 revoke execute on function public.admin_user_status(text) from public, anon, authenticated;
 revoke execute on function public.admin_find_users(text) from public, anon, authenticated;
 revoke execute on function public.admin_reset_password(text, text) from public, anon, authenticated;
+revoke execute on function public.admin_fix_login_email(uuid, text) from public, anon, authenticated;
+revoke execute on function public.admin_migrate_email_logins() from public, anon, authenticated;
