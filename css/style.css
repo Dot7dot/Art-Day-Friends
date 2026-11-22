@@ -914,6 +914,9 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
 }
 .notice-title { font-size: 15px; letter-spacing: .08em; margin-bottom: 4px; color: #fff; }
 .notice-body { font-size: 13.5px; line-height: 1.7; color: rgba(255, 255, 255, .9); overflow-wrap: anywhere; }
+.notice-link { color: #fff; font-weight: 700; text-decoration: underline; text-decoration-color: var(--orange); text-decoration-thickness: 2px; text-underline-offset: 3px; overflow-wrap: anywhere; border-radius: 3px; }
+.notice-link:hover { text-decoration-color: #fff; }
+.notice-link:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
 
 .wish-row { margin: 0 0 16px; display: flex; }
 .wish-pill {
