@@ -2,6 +2,8 @@
 // 資料表與安全規則見 supabase/schema.sql
 
 import { MSG } from './recovery.js';
+import { getImageBlob, maintain as maintainImageCache, clear as clearImageCache } from './image-cache.js';
+import { dataURLToBlob } from './imaging.js';
 
 const LIB = '../vendor/supabase-js-2.117.3.mjs';
 
@@ -101,7 +103,6 @@ export async function createSupabaseBackend(url, anonKey) {
   let replyOk = true; // drawing_comments 有 reply_to 欄位嗎
   let me = null;
   let authBusy = false; // 自己正在登入／註冊時，不重複處理登入事件
-  const imageCache = new Map();
 
   // 查個人檔案時一併取 avatar；資料庫還沒更新時退回不含 avatar 的查詢，並記住（本次使用期間）
   // self = 這是「我自己」的檔案：多查 share_public（推薦設定）；欄位不存在時同樣退回
@@ -159,6 +160,7 @@ export async function createSupabaseBackend(url, anonKey) {
       const { data, error } = await sb.auth.getSession();
       if (error) console.warn(error);
       me = data?.session ? await loadProfile(data.session.user) : null;
+      maintainImageCache(); // 啟動時順手清掉過期的圖片快取（背景進行）
       return me;
     },
 
@@ -345,7 +347,7 @@ export async function createSupabaseBackend(url, anonKey) {
       const ids = rows.map((r) => r.user_id);
       const now = new Date().toISOString();
       const [drawings, notes] = await Promise.all([
-        sb.from('drawings').select('id, user_id, width, height, created_at').in('user_id', ids).gt('expires_at', now).order('created_at'),
+        sb.from('drawings').select('id, user_id, width, height, created_at, expires_at').in('user_id', ids).gt('expires_at', now).order('created_at'),
         sb.from('day_notes').select('user_id, note, updated_at').in('user_id', ids).gt('expires_at', now).order('updated_at', { ascending: false }),
       ]);
       const ds = check(drawings);
@@ -357,7 +359,7 @@ export async function createSupabaseBackend(url, anonKey) {
         return {
           profile: mapProfile({ id: r.user_id, username: r.username, display_name: r.display_name, avatar: r.avatar }),
           mutualCount: r.mutual_count || 0,
-          drawings: mine.map((d) => ({ id: d.id, width: d.width, height: d.height, createdAt: d.created_at })),
+          drawings: mine.map((d) => ({ id: d.id, width: d.width, height: d.height, createdAt: d.created_at, expiresAt: d.expires_at })),
           note: note?.note || '',
           lastAt: times[times.length - 1] || r.last_at || null,
         };
@@ -449,14 +451,23 @@ export async function createSupabaseBackend(url, anonKey) {
       };
     },
 
-    async fetchDrawingImage(id) {
-      if (imageCache.has(id)) return imageCache.get(id);
-      const row = check(await sb.from('drawings').select('image').eq('id', id).maybeSingle());
-      if (!row) throw new Error('這張畫已經不在雲端了');
-      if (!/^data:image\/(jpeg|png|webp);base64,/.test(row.image)) throw new Error('圖片格式不正確');
-      imageCache.set(id, row.image);
-      return row.image;
+    /**
+     * 別人的畫的圖片（Blob）。順序：記憶體 → 裝置快取（IndexedDB）→ 網路；網路下載後會寫回快取。
+     * 同一張圖同時被要求多次只會下載一次。自己的畫（user_id 是我）不寫入快取（本來就在本機 archive）。
+     * 只有這個函式會查 drawings.image 欄位；其他查詢一律不選 image。
+     */
+    fetchDrawingBlob(id) {
+      return getImageBlob(id, async () => {
+        const row = check(await sb.from('drawings').select('image, user_id, expires_at').eq('id', id).maybeSingle());
+        if (!row) throw new Error('這張畫已經不在雲端了');
+        if (!/^data:image\/(jpeg|png|webp);base64,/.test(row.image)) throw new Error('圖片格式不正確');
+        return { blob: dataURLToBlob(row.image), expiresAt: row.expires_at, skipStore: row.user_id === me?.id };
+      });
     },
+
+    /** 裝置上的圖片快取：維護（刪過期／太舊／超量）與清除 */
+    maintainImageCache,
+    clearImageCache,
 
     async fetchFriendsToday() {
       const { friends } = await api.listFriendships();
@@ -464,7 +475,7 @@ export async function createSupabaseBackend(url, anonKey) {
       const ids = friends.map((f) => f.id);
       const now = new Date().toISOString();
       const [drawings, notes] = await Promise.all([
-        sb.from('drawings').select('id, user_id, width, height, created_at').in('user_id', ids).gt('expires_at', now).order('created_at'),
+        sb.from('drawings').select('id, user_id, width, height, created_at, expires_at').in('user_id', ids).gt('expires_at', now).order('created_at'),
         sb.from('day_notes').select('user_id, note, updated_at').in('user_id', ids).gt('expires_at', now).order('updated_at', { ascending: false }),
       ]);
       const ds = check(drawings);
@@ -475,7 +486,7 @@ export async function createSupabaseBackend(url, anonKey) {
         const times = [...mine.map((d) => d.created_at), note?.updated_at].filter(Boolean).sort();
         return {
           profile: p,
-          drawings: mine.map((d) => ({ id: d.id, width: d.width, height: d.height, createdAt: d.created_at })),
+          drawings: mine.map((d) => ({ id: d.id, width: d.width, height: d.height, createdAt: d.created_at, expiresAt: d.expires_at })),
           note: note?.note || '',
           lastAt: times[times.length - 1] || null,
         };
@@ -583,6 +594,7 @@ export async function createSupabaseBackend(url, anonKey) {
         sb.from('day_notes').delete().eq('user_id', me.id).lt('day', today),
         sb.rpc('purge_expired'),
       ]);
+      maintainImageCache();
     },
   };
   return api;

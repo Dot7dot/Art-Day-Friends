@@ -4,6 +4,7 @@
 import { SUPABASE_URL, SUPABASE_ANON_KEY, MAX_CLOUD_DRAWINGS_PER_DAY as CLOUD_MAX } from './config.js';
 import * as archive from './archive.js';
 import * as pending from './pending-import.js';
+import * as imgCache from './image-cache.js';
 import { processImage, cloudCopy, makeThumb, dataURLToBlob, makeAvatar } from './imaging.js';
 import { icon } from './icons.js';
 import { dayKey, addDays, endOfDay, dayParts, formatDayLong, formatDayShort, timeLeftToday, formatTime, formatAgo } from './dates.js';
@@ -70,11 +71,14 @@ function newCtx() {
 
 function makeCtx() {
   const urls = [];
+  const named = new Map(); // key -> object URL (one per image per view; reused when the feed refreshes)
   const timers = [];
   const cleanups = [];
   const c = {
     alive: true,
     url(blob) { const u = URL.createObjectURL(blob); urls.push(u); return u; },
+    keyedUrl(key, blob) { if (!named.has(key)) named.set(key, c.url(blob)); return named.get(key); },
+    knownUrl(key) { return named.get(key); },
     every(fn, ms) { timers.push(setInterval(fn, ms)); },
     onDispose(fn) { cleanups.push(fn); },
     dispose() {
@@ -936,7 +940,7 @@ async function syncToday() {
   for (const r of remote.drawings) {
     if (have.has(r.id)) continue;
     try {
-      const blob = dataURLToBlob(await state.backend.fetchDrawingImage(r.id));
+      const blob = await state.backend.fetchDrawingBlob(r.id);
       await archive.putDrawing({
         id: r.id, userId: me.id, day, blob, thumb: await makeThumb(blob), width: r.width, height: r.height,
         createdAt: Date.parse(r.createdAt) || Date.now(), source: 'cloud', cloud: 'synced',
@@ -1707,8 +1711,9 @@ async function openNotificationDrawing(n) {
     return;
   }
   let image;
-  try { image = await state.backend.fetchDrawingImage(n.drawingId); } catch (e) { console.warn(e); gone(); return; }
+  try { image = URL.createObjectURL(await state.backend.fetchDrawingBlob(n.drawingId)); } catch (e) { console.warn(e); gone(); return; }
   openDrawingModal({
+    onClose: () => setTimeout(() => URL.revokeObjectURL(image), 1000),
     title: '好友的畫 · 今天',
     src: image,
     alt: '好友今天的畫',
@@ -1852,6 +1857,7 @@ function mountMine(slot, c) {
 }
 
 // ── 推薦貼文（非好友、同意公開分享的人今天的畫）──
+const IMG_CONCURRENCY = 3;  // 同時載入幾張好友的圖
 const RECO_SHOW = 4;        // 首頁最多顯示幾位
 const RECO_AFTER = 3;       // 規則：放在好友的第 3 則貼文之後；好友貼文不到 3 則就放在最後；沒有好友時也會顯示
 const recoHiddenKey = () => `artday.reco.hidden.${state.me?.id}`;
@@ -2001,21 +2007,52 @@ async function paintFeed(body, c) {
     for (const id of friendImages.keys()) setCmtBadge(body, id, counts.get(id) || 0, true);
   });
 
-  // 逐張載入圖片（一次最多 3 張）
-  const queue = $$('img[data-cloud-id]', body);
-  const worker = async () => {
-    while (queue.length && c.alive) {
-      const img = queue.shift();
-      const d = images.get(img.dataset.cloudId);
-      try {
-        img.src = d?.image || await state.backend.fetchDrawingImage(img.dataset.cloudId);
-        img.addEventListener('load', () => img.closest('.post-img')?.classList.add('loaded'), { once: true });
-      } catch (e) {
-        img.closest('.post-img')?.classList.add('gone');
-      }
+  // 圖片：已經載過的（同一個畫面內）直接沿用；其餘等捲到畫面附近（上下 400px）才載入，一次最多 3 張。
+  // 好友的圖先看裝置快取，沒有才下載；動態重新整理只更新文字資料，不會重新下載圖片。
+  const show = (img, src) => {
+    img.addEventListener('load', () => img.closest('.post-img')?.classList.add('loaded'), { once: true });
+    img.src = src;
+  };
+  const loadImg = async (img) => {
+    const id = img.dataset.cloudId;
+    const d = images.get(id);
+    try {
+      if (d?.image) { show(img, d.image); return; } // 示範模式：圖片本來就在資料裡
+      const blob = await state.backend.fetchDrawingBlob(id);
+      if (c.alive && img.isConnected) show(img, c.keyedUrl(id, blob));
+    } catch (e) {
+      img.closest('.post-img')?.classList.add('gone');
     }
   };
-  await Promise.all([worker(), worker(), worker()]);
+  const waiting = [];
+  let running = 0;
+  const pump = () => {
+    while (running < IMG_CONCURRENCY && waiting.length && c.alive) {
+      const img = waiting.shift();
+      if (!img.isConnected) continue;
+      running++;
+      loadImg(img).finally(() => { running--; pump(); });
+    }
+  };
+  body._imgObserver?.disconnect();
+  const toLoad = [];
+  for (const img of $$('img[data-cloud-id]', body)) {
+    const known = c.knownUrl(img.dataset.cloudId);
+    if (known) show(img, known); else toLoad.push(img);
+  }
+  if (!toLoad.length) return;
+  if (!('IntersectionObserver' in window)) { waiting.push(...toLoad); pump(); return; }
+  const io = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      if (!en.isIntersecting) continue;
+      io.unobserve(en.target);
+      waiting.push(en.target);
+    }
+    pump();
+  }, { rootMargin: '400px 0px' });
+  body._imgObserver = io;
+  c.onDispose(() => io.disconnect());
+  toLoad.forEach((img) => io.observe(img));
 }
 
 function postCard(p, { reco = false } = {}) {
@@ -2733,6 +2770,8 @@ async function viewMe(el, c) {
           </div></div>` : ''}
         <p>你所有的畫都保存在<b>這台裝置的瀏覽器</b>裡。清除瀏覽器資料或換手機前，記得先匯出備份。</p>
         <div class="kv"><span>目前使用空間</span><b>${est ? formatBytes(est.usage) : '—'}</b></div>
+        <div class="kv kv-cache"><span data-imgcache-text>本機圖片快取：…</span><button class="btn btn-small" data-imgcache-clear hidden>清除快取</button></div>
+        <p class="field-hint">好友的畫看過一次就暫存在這台裝置（隔天自動清掉），重開 App 不必再下載，節省流量。</p>
         <div class="kv"><span>防止瀏覽器自動清除</span>
           ${persisted ? `<b class="ok-text">${icon('shield', 16)} 已開啟</b>` : `<button class="btn btn-small" data-persist>${icon('shield', 16)}<span>開啟保護</span></button>`}
         </div>
@@ -2763,6 +2802,24 @@ async function viewMe(el, c) {
   const avatarInput = $('#avatar-input', el);
 
   mountNotifications($('#notif-slot', el), c, notifs);
+
+  // 本機圖片快取（別人的畫）：顯示張數與大小，可以手動清除
+  const cacheText = $('[data-imgcache-text]', el);
+  const cacheClear = $('[data-imgcache-clear]', el);
+  const showCache = async () => {
+    const st = await imgCache.stats();
+    if (!c.alive) return;
+    cacheText.textContent = st.unavailable ? '本機圖片快取：無法使用' : `本機圖片快取：${st.count} 張 / ${(st.bytes / 1024 / 1024).toFixed(1)} MB`;
+    cacheClear.hidden = !st.count;
+  };
+  showCache();
+  cacheClear.addEventListener('click', async () => {
+    setBusy(cacheClear, true);
+    await (state.backend.clearImageCache ? state.backend.clearImageCache() : imgCache.clear());
+    setBusy(cacheClear, false);
+    toast('已清除圖片快取');
+    showCache();
+  });
 
   // 安裝按鈕：beforeinstallprompt 可能在頁面打開之後才來，來了就更新
   const installSlot = $('[data-install-slot]', el);
