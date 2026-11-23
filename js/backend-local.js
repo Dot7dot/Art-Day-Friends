@@ -5,6 +5,7 @@
 import { openDB, promisify, run } from './idb.js';
 import { dayKey, endOfDay } from './dates.js';
 import { demoArt } from './demo-art.js';
+import { dataURLToBlob } from './imaging.js';
 import { recoverySecret, MAX_FAILED_ATTEMPTS } from './recovery.js';
 
 const K_USERS = 'artday.demo.users';
@@ -542,10 +543,11 @@ export async function createLocalBackend() {
       };
     },
 
-    async fetchDrawingImage(id) {
+    /** 和雲端版同介面：回傳圖片 Blob（示範模式的圖片本來就在本機，不需要快取） */
+    async fetchDrawingBlob(id) {
       const d = await run(cloud, 'drawings', 'readonly', ({ drawings }) => promisify(drawings.get(id)));
       if (!d || d.expiresAt <= nowIso()) throw new Error('這張畫已經不在雲端了');
-      return d.image;
+      return dataURLToBlob(d.image);
     },
 
     async fetchFriendsToday() {

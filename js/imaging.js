@@ -1,9 +1,10 @@
 // 圖片處理：本機保存較高畫質，雲端只放壓縮過的「今天」副本，縮圖給日曆用。
 
 const LOCAL_MAX = 2048;   // 本機保存的最長邊
-const CLOUD_MAX = 1280;   // 雲端副本的最長邊
+const CLOUD_MAX = 1080;   // 雲端副本的最長邊（好友在手機上看，夠清楚又省流量）
 const THUMB_MAX = 360;    // 日曆縮圖
-const CLOUD_LIMIT = 900_000; // 雲端副本 data URL 的大小上限（字元）
+const CLOUD_QUALITY = 0.75;  // 雲端副本的 JPEG 品質
+const CLOUD_LIMIT = 260_000; // 雲端副本 data URL 的大小上限（字元，約 190 KB）；太複雜的圖會逐步縮小直到低於它
 
 /** 先用 <img> 讀出（已套用 EXIF 方向的）尺寸；失敗就回傳 null */
 function probeSize(blob) {
@@ -94,13 +95,13 @@ export async function cloudCopy(blob) {
   const src = await decode(blob);
   try {
     let max = CLOUD_MAX;
-    let q = 0.82;
+    let q = CLOUD_QUALITY;
     let url = '';
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
       url = drawScaled(src, max).toDataURL('image/jpeg', q);
       if (url.length <= CLOUD_LIMIT) break;
-      max = Math.round(max * 0.8);
-      q = Math.max(0.5, q - 0.08);
+      max = Math.round(max * 0.85);
+      q = Math.max(0.5, q - 0.06);
     }
     return url;
   } finally { release(src); }
