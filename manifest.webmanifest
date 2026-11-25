@@ -1,7 +1,7 @@
 {
   "name": "Art Day · 藝術小日曆",
   "short_name": "Art Day",
-  "description": "每天隨手畫一張，只給今天的朋友看。",
+  "description": "每天隨手畫一張，只給朋友看 24 小時。",
   "lang": "zh-Hant",
   "id": "./",
   "start_url": "./#/friends",

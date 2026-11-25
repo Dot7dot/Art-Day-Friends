@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────
 //  Art Day 設定檔
 // ─────────────────────────────────────────────────────────────
-//  想讓大家跨裝置註冊、加好友、看到彼此今天的畫，
+//  想讓大家跨裝置註冊、加好友、看到彼此 24 小時內的畫，
 //  請建立一個免費的 Supabase 專案，並把下面兩個值填上（步驟見 README.md）。
 //
 //  兩個值都留空 → App 會以「本機示範模式」運作：
@@ -14,5 +14,5 @@
 export const SUPABASE_URL = 'https://hjslgoxniiysyjnupyri.supabase.co';
 export const SUPABASE_ANON_KEY = 'sb_publishable_HMTOnp6WRu4m8ScjcPTJyw_ukHuK9xi'; // publishable key：可公開
 
-// 每個人每天最多同步到雲端的圖片張數（超過的只存在本機）
+// 每個人「同時」最多在雲端分享的圖片張數（每張從上傳起分享 24 小時；超過的只存在本機）
 export const MAX_CLOUD_DRAWINGS_PER_DAY = 6;

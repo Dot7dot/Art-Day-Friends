@@ -17,11 +17,20 @@ export function addDays(key, n) {
   return dayKey(d);
 }
 
-/** 該日結束（隔天 00:00）的時間點：雲端的圖會在這之後失效 */
-export function endOfDay(key) {
-  const d = parseDay(key);
-  d.setDate(d.getDate() + 1);
-  return d;
+/** 每張畫在雲端分享的時間：從上傳那一刻起 24 小時（不看日期） */
+export const SHARE_MS = 24 * 60 * 60 * 1000;
+
+/** 這張畫（createdAt：毫秒或日期字串）的分享截止時間（毫秒） */
+export const shareEnd = (createdAt) => new Date(createdAt).getTime() + SHARE_MS;
+
+/** 還在分享期內嗎？ */
+export const isSharing = (createdAt, now = Date.now()) => shareEnd(createdAt) > now;
+
+/** 剩餘時間的文字：「5 小時」「40 分鐘」；已到期回傳空字串 */
+export function formatRemaining(ms) {
+  if (!(ms > 0)) return '';
+  const mins = Math.ceil(ms / 60000);
+  return mins >= 60 ? `${Math.floor(mins / 60)} 小時` : `${mins} 分鐘`;
 }
 
 export const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
@@ -46,15 +55,6 @@ export function formatDayLong(key) {
 export function formatDayShort(key) {
   const p = dayParts(key);
   return `${p.month} 月 ${p.date} 日 ${p.weekday}`;
-}
-
-/** 距離今天結束還有多久，例如「7 小時 12 分」 */
-export function timeLeftToday(now = new Date()) {
-  const end = endOfDay(dayKey(now));
-  const mins = Math.max(0, Math.ceil((end - now) / 60000));
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return h > 0 ? `${h} 小時 ${m} 分` : `${m} 分鐘`;
 }
 
 export function formatTime(ts) {

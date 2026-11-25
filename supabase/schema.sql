@@ -5,12 +5,12 @@
 -- ════════════════════════════════════════════════════════════════
 --
 --  設計重點
---  • 圖片「大部分存在本機」：雲端只放每個人「今天」的壓縮副本。
---  • 每筆雲端資料都有 expires_at（上傳者當地的「今天結束」時間），
+--  • 圖片「大部分存在本機」：雲端只放每個人最近 24 小時內發佈的壓縮副本。
+--  • 每筆雲端資料都有 expires_at（上傳那一刻起算 24 小時，由資料庫固定，不看日期、不看時區），
 --    過期後好友就讀不到（RLS 擋住），並由排程／App 自動刪除。
---  • 只有互相是好友（accepted）的人，才看得到對方今天的畫與文字。
---  • 好友可以在今天的畫上留言；留言是很小的純文字，永久保留給畫的主人。
---  • 推薦貼文（選擇加入）：profiles.share_public = true 的人，今天的畫與文字
+--  • 只有互相是好友（accepted）的人，才看得到對方 24 小時內的畫與文字。
+--  • 好友可以在還在分享中的畫上留言；留言是很小的純文字，永久保留給畫的主人。
+--  • 推薦貼文（選擇加入）：profiles.share_public = true 的人，24 小時內的畫與文字
 --    非好友也看得到（只能看，不能留言）。預設關閉，要使用者自己打開。
 --  • 留言可以回覆別人（reply_to）；被回覆的人與被「戳」的人會收到通知（notifications）。
 --  • 許願池（wishes）：使用者許願新功能，只有本人看得到自己的願望，網站管理員在 Dashboard 看全部。
@@ -32,7 +32,7 @@ alter table public.profiles drop constraint if exists profiles_avatar_check;
 alter table public.profiles add constraint profiles_avatar_check
   check (avatar is null or (avatar ~ '^data:image/(jpeg|png|webp);base64,' and char_length(avatar) <= 60000));
 
--- 推薦貼文：同意「非好友也能看到我今天的畫」。預設 false（要使用者自己開啟）
+-- 推薦貼文：同意「非好友也能看到我 24 小時內的畫」。預設 false（要使用者自己開啟）
 alter table public.profiles add column if not exists share_public boolean not null default false;
 
 alter table public.profiles enable row level security;
@@ -198,7 +198,7 @@ $$;
 revoke execute on function public.is_my_friend(uuid) from public, anon;
 grant execute on function public.is_my_friend(uuid) to authenticated;
 
--- 某人有沒有同意公開分享今天的畫（給 RLS 使用；security definer 才不會在 profiles 的規則裡繞圈）
+-- 某人有沒有同意公開分享 24 小時內的畫（給 RLS 使用；security definer 才不會在 profiles 的規則裡繞圈）
 create or replace function public.is_public_profile(uid uuid)
 returns boolean
 language sql
@@ -266,7 +266,7 @@ revoke execute on function public.suggest_friends(int) from public, anon;
 grant execute on function public.suggest_friends(int) to authenticated;
 
 
--- ── 3. 今天的畫（只放當天，隔天刪除）───────────────────────────────
+-- ── 3. 分享中的畫（每張從上傳起保留 24 小時）───────────────────────────────
 create table if not exists public.drawings (
   id         uuid primary key,
   user_id    uuid not null default auth.uid() references public.profiles (id) on delete cascade,
@@ -283,7 +283,7 @@ create index if not exists drawings_expires_idx on public.drawings (expires_at);
 
 alter table public.drawings enable row level security;
 
--- 自己的永遠看得到；今天的畫：好友，或同意公開分享（推薦貼文）的人
+-- 自己的永遠看得到；24 小時內的畫：好友，或同意公開分享（推薦貼文）的人
 drop policy if exists "drawings: owner or friends today" on public.drawings;
 create policy "drawings: owner or friends today" on public.drawings
   for select to authenticated
@@ -304,7 +304,8 @@ revoke all on public.drawings from anon;
 revoke update on public.drawings from authenticated;
 grant select, insert, delete on public.drawings to authenticated;
 
--- 寫入時把關：只能放「今天」的圖（expires_at 必須在 26 小時內），每天最多 6 張
+-- 寫入時把關：expires_at 一律由資料庫設成「現在 + 24 小時」（不理會前端送來的值），
+-- 同一時間最多 6 張還在分享中的畫
 create or replace function public.guard_drawing()
 returns trigger
 language plpgsql
@@ -312,12 +313,10 @@ set search_path = ''
 as $$
 begin
   new.created_at := now();
-  if new.expires_at <= now() or new.expires_at > now() + interval '26 hours' then
-    raise exception 'expires_at must be the end of today';
-  end if;
+  new.expires_at := now() + interval '24 hours';
   if (select count(*) from public.drawings d
        where d.user_id = new.user_id and d.expires_at > now()) >= 6 then
-    raise exception 'daily cloud limit reached';
+    raise exception 'daily cloud limit reached (6 live drawings)';
   end if;
   return new;
 end;
@@ -329,7 +328,12 @@ create trigger drawings_guard
   for each row execute function public.guard_drawing();
 
 
--- ── 4. 今天的文字記錄（同樣只放當天）──────────────────────────────
+-- 一次性升級（可重複執行）：舊版的 expires_at 是「當天午夜」，改成「上傳起 24 小時」。
+-- 只延長還在分享中、且比 24 小時短的，已過期的不動。
+update public.drawings set expires_at = created_at + interval '24 hours'
+ where expires_at > now() and expires_at < created_at + interval '24 hours';
+
+-- ── 4. 分享中的文字記錄（每次儲存後保留 24 小時）──────────────────────────────
 create table if not exists public.day_notes (
   user_id    uuid not null default auth.uid() references public.profiles (id) on delete cascade,
   day        date not null,
@@ -373,9 +377,7 @@ set search_path = ''
 as $$
 begin
   new.updated_at := now();
-  if new.expires_at <= now() or new.expires_at > now() + interval '26 hours' then
-    raise exception 'expires_at must be the end of today';
-  end if;
+  new.expires_at := now() + interval '24 hours'; -- 最後一次儲存後再分享 24 小時
   return new;
 end;
 $$;
@@ -385,8 +387,15 @@ create trigger day_notes_guard
   before insert or update on public.day_notes
   for each row execute function public.guard_note();
 
+-- 一次性升級（可重複執行）：文字記錄同上，從最後儲存起算 24 小時。
+-- guard_note 會在更新時把 updated_at 重設成現在，所以升級這一步暫時關掉它。
+alter table public.day_notes disable trigger day_notes_guard;
+update public.day_notes set expires_at = updated_at + interval '24 hours'
+ where expires_at > now() and expires_at < updated_at + interval '24 hours';
+alter table public.day_notes enable trigger day_notes_guard;
 
--- 推薦貼文：同意公開分享、不是我、和我沒有任何好友關係（含待回覆）、而且今天還有畫的人。
+
+-- 推薦貼文：同意公開分享、不是我、和我沒有任何好友關係（含待回覆）、而且 24 小時內還有畫的人。
 -- 共同好友多的在前，再依最近發佈時間。只回傳共同好友的「數量」，不洩漏是誰。
 -- （不會用到 drawings 的 RLS：security definer 在資料庫內算，圖片仍由前端用一般查詢讀取）
 drop function if exists public.recommended_posts(int);
@@ -448,7 +457,7 @@ grant execute on function public.recommended_posts(int) to authenticated;
 
 -- ── 5. 畫的留言（永久保留，不跟著畫一起刪除）──────────────────────────
 --  • 好友可以在「還沒過期」的畫上留言；畫的主人能永遠看到所有留言。
---  • drawing_id 刻意不設外鍵：畫過了今天就會被清掉，留言要留下來。
+--  • drawing_id 刻意不設外鍵：畫過了 24 小時就會被清掉，留言要留下來。
 --  • drawing_owner、day 由觸發器從畫本身複製，前端無法偽造。
 create table if not exists public.drawing_comments (
   id            uuid primary key default gen_random_uuid(),
@@ -825,7 +834,7 @@ create trigger cheers_guard_upd
 
 
 -- ── 6. 自動清除過期資料 ──────────────────────────────────────────
--- 只清畫、當天文字、過期的打氣留言與 30 天前的通知；留言（drawing_comments）刻意不清，畫的主人要永遠看得到。
+-- 只清過期的畫、過期的文字、過期的打氣留言與 30 天前的通知；留言（drawing_comments）刻意不清，畫的主人要永遠看得到。
 create or replace function public.purge_expired()
 returns integer
 language plpgsql
