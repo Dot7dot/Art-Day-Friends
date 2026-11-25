@@ -22,8 +22,8 @@ const ERRORS = [
   [/signups? not allowed/i, '目前沒有開放註冊'],
   [/rate limit|too many requests|security purposes/i, '操作太頻繁了，請稍等一下再試'],
   [/database error saving new user/i, '註冊失敗：使用者 ID 可能已被使用'],
-  [/daily cloud limit/i, '今天上傳到雲端的張數已達上限'],
-  [/drawing is not live/i, '這張畫已經過了今天，不能再留言了'],
+  [/(daily )?cloud limit/i, '雲端同時分享的張數已達上限（6 張），這張先存在本機'],
+  [/drawing is not live/i, '這張畫已經超過 24 小時，不能再留言了'],
   [/cheer limit/i, '24 小時內最多留 20 則打氣，明天再來吧'],
   [/wish limit/i, '24 小時內最多許 10 個願望，明天再來許吧'],
   [/invalid reply target|violates foreign key.*reply_to/i, '你要回覆的那則留言已經不見了'],
@@ -338,7 +338,7 @@ export async function createSupabaseBackend(url, anonKey) {
     },
 
     /**
-     * 推薦貼文：不是好友、同意公開分享、今天有畫的人，連同今天的畫（只有資料，圖片之後逐張載入）與文字。
+     * 推薦貼文：不是好友、同意公開分享、24 小時內有畫的人，連同這些畫（只有資料，圖片之後逐張載入）與文字。
      * 資料庫還沒更新（沒有 recommended_posts）時丟出錯誤（code PGRST202／42883），畫面就不顯示這一區。
      */
     async recommendedPosts(limit = 6) {
@@ -377,8 +377,10 @@ export async function createSupabaseBackend(url, anonKey) {
     },
 
     async uploadDrawing({ id, day, image, width, height, expiresAt }) {
-      const { error } = await sb.from('drawings').insert({ id, user_id: me.id, day, image, width, height, expires_at: expiresAt });
+      // 期限由資料庫固定為現在起 24 小時；回傳實際的 expires_at（已經上傳過則回傳 null）
+      const { data, error } = await sb.from('drawings').insert({ id, user_id: me.id, day, image, width, height, expires_at: expiresAt }).select('expires_at').maybeSingle();
       if (error && error.code !== '23505') throw friendly(error); // 23505 = 已經上傳過
+      return data?.expires_at || null;
     },
 
     async deleteDrawing(id) {
@@ -419,7 +421,7 @@ export async function createSupabaseBackend(url, anonKey) {
       const { data, error } = await sb.from('drawing_comments').insert(row)
         .select(replyOk ? COMMENT_COLS_REPLY : COMMENT_COLS).single();
       if (error) {
-        if (error.code === '42501') throw Object.assign(new Error('只有好友可以在今天的畫上留言'), { cause: error });
+        if (error.code === '42501') throw Object.assign(new Error('只有好友可以在還在分享中的畫上留言'), { cause: error });
         if (replyTo && isMissingSchema(error)) { replyOk = false; throw FEATURE_UNSUPPORTED('回覆'); }
         if (replyTo && error.code === '23503') throw Object.assign(new Error('你要回覆的那則留言已經不見了'), { cause: error });
         throw friendly(error);
@@ -431,7 +433,7 @@ export async function createSupabaseBackend(url, anonKey) {
       check(await sb.from('drawing_comments').delete().eq('id', id));
     },
 
-    async saveNote({ day, note, expiresAt }) {
+    async saveNote({ day, note, expiresAt }) { // expiresAt 只是建議值：資料庫固定為儲存後 24 小時
       if (note.trim()) {
         check(await sb.from('day_notes').upsert({ user_id: me.id, day, note, expires_at: expiresAt }, { onConflict: 'user_id,day' }));
       } else {
@@ -439,15 +441,16 @@ export async function createSupabaseBackend(url, anonKey) {
       }
     },
 
-    async fetchMyToday(day) {
+    /** 我自己還在分享中（24 小時內）的畫與文字，不分哪一天（給別台裝置同步用） */
+    async fetchMyLive() {
       const now = new Date().toISOString();
-      const [drawings, note] = await Promise.all([
-        sb.from('drawings').select('id, width, height, created_at').eq('user_id', me.id).eq('day', day).gt('expires_at', now).order('created_at'),
-        sb.from('day_notes').select('note').eq('user_id', me.id).eq('day', day).gt('expires_at', now).maybeSingle(),
+      const [drawings, notes] = await Promise.all([
+        sb.from('drawings').select('id, day, width, height, created_at, expires_at').eq('user_id', me.id).gt('expires_at', now).order('created_at'),
+        sb.from('day_notes').select('day, note').eq('user_id', me.id).gt('expires_at', now),
       ]);
       return {
-        drawings: check(drawings).map((d) => ({ id: d.id, width: d.width, height: d.height, createdAt: d.created_at })),
-        note: check(note)?.note || '',
+        drawings: check(drawings).map((d) => ({ id: d.id, day: d.day, width: d.width, height: d.height, createdAt: d.created_at, expiresAt: d.expires_at })),
+        notes: check(notes).map((n) => ({ day: n.day, note: n.note })),
       };
     },
 
@@ -587,11 +590,12 @@ export async function createSupabaseBackend(url, anonKey) {
       return String(data);
     },
 
-    /** 把自己「今天以前」的雲端副本刪掉，並順手清掉所有人已過期的資料 */
-    async purgeMyPast(today) {
+    /** 把自己已過期（超過 24 小時）的雲端副本刪掉，並順手清掉所有人已過期的資料；沒到期的不動 */
+    async purgeMyPast() {
+      const now = new Date().toISOString();
       await Promise.all([
-        sb.from('drawings').delete().eq('user_id', me.id).lt('day', today),
-        sb.from('day_notes').delete().eq('user_id', me.id).lt('day', today),
+        sb.from('drawings').delete().eq('user_id', me.id).lte('expires_at', now),
+        sb.from('day_notes').delete().eq('user_id', me.id).lte('expires_at', now),
         sb.rpc('purge_expired'),
       ]);
       maintainImageCache();

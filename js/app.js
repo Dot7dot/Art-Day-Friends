@@ -1,5 +1,5 @@
 // Art Day · 藝術小日曆
-// 每天隨手畫一張，只給今天的朋友看；所有的畫都留在自己的裝置裡。
+// 每天隨手畫一張，只給朋友看 24 小時；所有的畫都留在自己的裝置裡。
 
 import { SUPABASE_URL, SUPABASE_ANON_KEY, MAX_CLOUD_DRAWINGS_PER_DAY as CLOUD_MAX } from './config.js';
 import * as archive from './archive.js';
@@ -7,7 +7,7 @@ import * as pending from './pending-import.js';
 import * as imgCache from './image-cache.js';
 import { processImage, cloudCopy, makeThumb, dataURLToBlob, makeAvatar } from './imaging.js';
 import { icon } from './icons.js';
-import { dayKey, addDays, endOfDay, dayParts, formatDayLong, formatDayShort, timeLeftToday, formatTime, formatAgo } from './dates.js';
+import { dayKey, addDays, dayParts, formatDayLong, formatDayShort, formatTime, formatAgo, shareEnd, formatRemaining } from './dates.js';
 import { esc, toast, openModal, confirmDialog, avatar, uuid, debounce, copyText, downloadBlob, setBusy } from './ui.js';
 import { openSketchPad } from './sketch.js';
 import { ANIMALS, checkRecoveryInput, SCHOOL_MAX, MSG as RECOVERY_MSG } from './recovery.js';
@@ -135,7 +135,13 @@ async function boot() {
   window.addEventListener('hashchange', render);
   setInterval(checkDayChange, 30_000);
   setInterval(() => { if (state.me && !document.hidden) refreshBadge(true); }, 60_000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkDayChange(); });
+  // 每分鐘更新畫面上「剩 N 小時」；有畫到期就把它標成「僅本機」
+  setInterval(() => { if (state.me && !document.hidden && tickShare(document) > 0) expireMine(); }, 60_000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    checkDayChange();
+    if (state.me) { tickShare(document); expireMine(); }
+  });
   render();
 }
 
@@ -151,15 +157,79 @@ function checkDayChange() {
   else dailyMaintenance();
 }
 
-/** 每天第一次打開：把以前的畫標成「只在本機」，並請雲端刪掉昨天以前的副本 */
+// ── 分享時間：每張畫從上傳起 24 小時（不看日期、不看午夜）──
+
+/** 這張本機畫的雲端副本到哪一刻為止：優先用伺服器回報的期限，沒有就用建立時間 + 24 小時 */
+const endOf = (d) => d.sharedUntil || shareEnd(d.createdAt);
+/** 雲端副本還在分享（或還來得及上傳）嗎？ */
+const sharing = (d, now = Date.now()) => d.cloud !== 'local' && endOf(d) > now;
+
+/** 最近幾天的本機畫（24 小時內的畫最多跨到昨天，多抓一點保險） */
+const recentMine = async () => (await archive.drawingsInRange(state.me.id, addDays(dayKey(), -3), '9999-99-99')).sort((a, b) => a.createdAt - b.createdAt);
+
+/** 目前還在分享中的畫（不分哪一天） */
+const sharingMine = async () => (await recentMine()).filter((d) => sharing(d));
+
+/** 分享期限到了的畫，在本機標成「僅本機」（按建立時間，不看日期） */
+async function expireMine() {
+  const me = state.me;
+  if (!me) return;
+  try {
+    const now = Date.now();
+    await archive.updateDrawings(me.id, (d) => d.cloud !== 'local' && endOf(d) <= now, () => ({ cloud: 'local' }));
+  } catch (e) { console.warn('expire failed', e); }
+}
+
+const STATUS = {
+  synced: { cls: 'ok', ico: 'cloud', text: '已分享' },
+  pending: { cls: 'warn', ico: 'refresh', text: '未同步・重試' },
+  local: { cls: '', ico: 'device', text: '僅本機' },
+};
+
+const localBadge = () => `<span class="badge">${icon(STATUS.local.ico, 14)}<span>${STATUS.local.text}</span></span>`;
+
+/**
+ * 一張畫的分享狀態標籤。分享中顯示剩餘時間（tickShare 每分鐘更新），到期就變「僅本機」。
+ * retry = true 時，未同步的做成可點的「重試」按鈕。
+ */
+function shareBadge(d, { retry = false } = {}) {
+  const now = Date.now();
+  if (d.cloud === 'local' || endOf(d) <= now) return localBadge();
+  const end = endOf(d);
+  if (d.cloud === 'pending') {
+    return retry
+      ? `<button class="badge warn" data-retry="${esc(d.id)}" data-share-end="${end}">${icon(STATUS.pending.ico, 14)}<span>${STATUS.pending.text}</span></button>`
+      : `<span class="badge warn" data-share-end="${end}">${icon(STATUS.pending.ico, 14)}<span>未同步</span></span>`;
+  }
+  return `<span class="badge ok" data-share-end="${end}">${icon('cloud', 14)}<span>分享中 · 剩 ${formatRemaining(end - now)}</span></span>`;
+}
+
+/** 更新 root 底下所有分享標籤的剩餘時間；到期的換成「僅本機」。回傳這次到期的個數 */
+function tickShare(root) {
+  const now = Date.now();
+  let expired = 0;
+  for (const el of root.querySelectorAll('[data-share-end]')) {
+    const end = Number(el.dataset.shareEnd);
+    if (end <= now) {
+      el.outerHTML = localBadge();
+      expired++;
+    } else if (el.classList.contains('ok')) {
+      el.lastElementChild.textContent = `分享中 · 剩 ${formatRemaining(end - now)}`;
+    }
+  }
+  return expired;
+}
+
+/** 每小時一次：把到期的畫標成「僅本機」，並請雲端刪掉我已過期的副本（沒到期的不動） */
 async function dailyMaintenance() {
   const me = state.me;
-  const today = state.today;
-  if (!me || state.maintainedDay === `${me.id}:${today}`) return;
-  state.maintainedDay = `${me.id}:${today}`;
+  if (!me) return;
+  await expireMine();
+  const key = `${me.id}:${state.today}:${new Date().getHours()}`;
+  if (state.maintainedDay === key) return;
+  state.maintainedDay = key;
   try {
-    await archive.updateDrawings(me.id, (d) => d.day < today && d.cloud !== 'local', () => ({ cloud: 'local' }));
-    await state.backend.purgeMyPast(today);
+    await state.backend.purgeMyPast();
   } catch (e) {
     console.warn('daily maintenance failed', e);
     state.maintainedDay = null;
@@ -278,7 +348,7 @@ function showCloudHelp() {
         <li>在 SQL Editor 執行專案裡的 <code>supabase/schema.sql</code>。</li>
         <li>把 Project URL 與 anon key 填進 <code>js/config.js</code>，推上 GitHub。</li>
       </ol>
-      <p class="muted small">詳細步驟請看專案的 README。連接後，大家就能各自註冊、加好友，並看到彼此今天的畫。</p>
+      <p class="muted small">詳細步驟請看專案的 README。連接後，大家就能各自註冊、加好友，並看到彼此 24 小時內的畫。</p>
       <div class="modal-foot"><button class="btn btn-primary" data-close>知道了</button></div>`,
   });
 }
@@ -331,7 +401,7 @@ function renderAuth() {
     <div class="auth">
       <div class="auth-card">
         <div class="auth-brand">${brandMark(46)}<div><h1>Art Day</h1><p>藝術小日曆</p></div></div>
-        <p class="auth-lead">每天隨手畫一張，<br>只給今天的朋友看。</p>
+        <p class="auth-lead">每天隨手畫一張，<br>只給朋友看 24 小時。</p>
         <div class="segmented" role="tablist" aria-label="註冊或登入">
           <button type="button" role="tab" data-mode="signup">註冊</button>
           <button type="button" role="tab" data-mode="login">登入</button>
@@ -345,8 +415,8 @@ function renderAuth() {
         </div>
       </div>
       <ul class="rules">
-        <li><span class="rule-ico">${icon('users')}</span><div><b>加好友</b><span>就能看到對方今天畫的圖</span></div></li>
-        <li><span class="rule-ico">${icon('hourglass')}</span><div><b>只有今天</b><span>過了今天，好友就看不到了</span></div></li>
+        <li><span class="rule-ico">${icon('users')}</span><div><b>加好友</b><span>就能看到對方 24 小時內畫的圖</span></div></li>
+        <li><span class="rule-ico">${icon('hourglass')}</span><div><b>24 小時</b><span>發佈 24 小時後，好友就看不到了</span></div></li>
         <li><span class="rule-ico">${icon('device')}</span><div><b>畫留在身邊</b><span>每一張都存在你的裝置，變成一本日曆</span></div></li>
       </ul>
       ${cloud ? '' : `<p class="auth-demo muted small"><span class="demo-dot"></span>示範模式：資料只存在這台裝置。<button class="link-btn" data-demo-help>如何連接雲端？</button></p>`}
@@ -584,7 +654,7 @@ function showRecoveryStep() {
 function shareSwitchHtml(checked, attrs = '') {
   return `<label class="switch-row">
     <span class="switch-text"><b>讓我的畫出現在推薦</b>
-      <span class="muted small">非好友也能看到我今天的畫與文字（只能看、不能留言），過了午夜就消失。可以隨時在「我的」關閉。</span></span>
+      <span class="muted small">非好友也能看到我 24 小時內的畫與文字（只能看、不能留言），時間到就消失。可以隨時在「我的」關閉。</span></span>
     <input type="checkbox" role="switch" name="sharePublic" ${attrs} ${checked ? 'checked' : ''}><span class="switch" aria-hidden="true"></span>
   </label>`;
 }
@@ -706,8 +776,7 @@ async function addDrawing(blob, source) {
   const me = state.me;
   const day = dayKey();
   const p = await processImage(blob);
-  const todays = await archive.drawingsOfDay(me.id, day);
-  const cloudUsed = todays.filter((d) => d.cloud !== 'local').length;
+  const cloudUsed = (await sharingMine()).length; // 同時分享中的張數（不分哪一天）
   const rec = {
     id: uuid(), userId: me.id, day, blob: p.full, thumb: p.thumb, width: p.width, height: p.height,
     createdAt: Date.now(), source, cloud: cloudUsed < CLOUD_MAX ? 'pending' : 'local',
@@ -716,19 +785,20 @@ async function addDrawing(blob, source) {
   return rec;
 }
 
-/** 把一張今天的畫上傳到雲端；失敗時保留為「待同步」 */
+/** 把一張畫上傳到雲端（建立 24 小時內都可以）；失敗時保留為「待同步」 */
 async function pushDrawing(rec) {
-  if (rec.day !== dayKey()) {
+  if (endOf(rec) <= Date.now()) { // 建立超過 24 小時：不再上傳
     await archive.putDrawing({ ...rec, cloud: 'local' });
     return false;
   }
   try {
     const image = await cloudCopy(rec.blob);
-    await state.backend.uploadDrawing({
+    const sharedUntil = await state.backend.uploadDrawing({
       id: rec.id, day: rec.day, image, width: rec.width, height: rec.height,
-      expiresAt: endOfDay(rec.day).toISOString(),
+      expiresAt: new Date(shareEnd(rec.createdAt)).toISOString(), // 建議值；實際期限由雲端固定為上傳起 24 小時
     });
     rec.cloud = 'synced';
+    if (sharedUntil) rec.sharedUntil = Date.parse(sharedUntil);
     await archive.putDrawing(rec);
     return true;
   } catch (e) {
@@ -811,7 +881,7 @@ async function addAndShareNow(blobs, source, { onPending, onChange, alive = () =
       try { await pushDrawing(rec); } catch (e) { failed++; console.warn(e); }
       await onChange?.();
     } else if (rec?.cloud === 'local') {
-      toast(`今天雲端已滿 ${CLOUD_MAX} 張，這張先存在本機`);
+      toast(`雲端同時最多分享 ${CLOUD_MAX} 張，這張先存在本機`);
     }
   }
   const action = link ? { action: { label: '查看', onClick: () => { location.hash = '#/today'; } } } : {};
@@ -864,7 +934,7 @@ const recoCardSeen = () => { try { return !!localStorage.getItem(recoCardKey());
 function markRecoCardSeen() { try { localStorage.setItem(recoCardKey(), '1'); } catch { /* 存不了就算了 */ } }
 
 async function removeDrawing(rec) {
-  if (rec.day === dayKey() && rec.cloud === 'synced') {
+  if (rec.cloud === 'synced' && endOf(rec) > Date.now()) {
     await state.backend.deleteDrawing(rec.id); // 先刪雲端（留言也會一起刪），失敗就整個取消
   }
   await archive.deleteDrawing(rec.id);
@@ -926,41 +996,38 @@ function setCmtBadge(root, id, n, always = false) {
   el.lastElementChild.textContent = n || '';
 }
 
-/** 同步今天：重試未上傳的、把別台裝置今天上傳的抓回本機 */
+/** 同步：重試未上傳的（24 小時內）、把別台裝置上傳且還在分享中的畫抓回本機（依它自己的日期歸檔） */
 async function syncToday() {
   const me = state.me;
   const day = dayKey();
   let changed = false;
-  const local = await archive.drawingsOfDay(me.id, day);
-  for (const d of local.filter((x) => x.cloud === 'pending')) {
+  const local = await recentMine();
+  for (const d of local.filter((x) => x.cloud === 'pending' && endOf(x) > Date.now())) {
     try { await pushDrawing(d); changed = true; } catch { /* 下次再試 */ }
   }
-  const remote = await state.backend.fetchMyToday(day);
+  const remote = await state.backend.fetchMyLive();
   const have = new Set(local.map((d) => d.id));
   for (const r of remote.drawings) {
     if (have.has(r.id)) continue;
     try {
       const blob = await state.backend.fetchDrawingBlob(r.id);
       await archive.putDrawing({
-        id: r.id, userId: me.id, day, blob, thumb: await makeThumb(blob), width: r.width, height: r.height,
+        id: r.id, userId: me.id, day: r.day || dayKey(new Date(r.createdAt)), blob, thumb: await makeThumb(blob), width: r.width, height: r.height,
         createdAt: Date.parse(r.createdAt) || Date.now(), source: 'cloud', cloud: 'synced',
+        sharedUntil: Date.parse(r.expiresAt) || undefined,
       });
       changed = true;
     } catch (e) { console.warn(e); }
   }
   let note = null;
-  if (remote.note && !(await archive.getNote(me.id, day))) {
-    await archive.putNote(me.id, day, remote.note);
-    note = remote.note;
+  for (const n of remote.notes) {
+    if (await archive.getNote(me.id, n.day)) continue;
+    await archive.putNote(me.id, n.day, n.note);
+    if (n.day === day) note = n.note;
+    changed = true;
   }
   return { changed, note };
 }
-
-const STATUS = {
-  synced: { cls: 'ok', ico: 'cloud', text: '已分享' },
-  pending: { cls: 'warn', ico: 'refresh', text: '未同步・重試' },
-  local: { cls: '', ico: 'device', text: '僅本機' },
-};
 
 async function mountToday(el, c, onData = () => {}) {
   const me = state.me;
@@ -1000,13 +1067,8 @@ async function mountToday(el, c, onData = () => {}) {
   const grid = $('#today-grid', el);
   const noteEl = $('#note', el);
   const noteState = $('#note-state', el);
-  const chipText = $('#cloud-chip span', el);
-
-  const tickChip = () => {
-    chipText.innerHTML = `<span>分享到今晚 24:00</span> · <span>還剩 ${timeLeftToday()}</span>`;
-  };
-  tickChip();
-  c.every(tickChip, 30_000);
+  $('#cloud-chip span', el).innerHTML = '<span>每張畫分享 24 小時</span>';
+  c.every(() => { if (tickShare(el) > 0) expireMine(); }, 30_000);
 
   let drawings = [];
   let counts = new Map();
@@ -1014,7 +1076,7 @@ async function mountToday(el, c, onData = () => {}) {
 
   /** 好友留在我今天的畫上的留言數 */
   async function refreshCounts() {
-    const ids = drawings.filter((d) => d.cloud === 'synced').map((d) => d.id);
+    const ids = drawings.filter((d) => sharing(d) && d.cloud === 'synced').map((d) => d.id);
     if (!ids.length || !c.alive) return;
     const list = await loadComments(ids, { mine: true });
     if (!c.alive) return;
@@ -1028,19 +1090,16 @@ async function mountToday(el, c, onData = () => {}) {
     const sig = drawings.map((d) => d.id).join();
     if (lastSig !== null && sig !== lastSig) onData();
     lastSig = sig;
-    const shared = drawings.filter((d) => d.cloud === 'synced').length;
+    const shared = drawings.filter((d) => sharing(d) && d.cloud === 'synced').length;
     $('#today-title', el).textContent = drawings.length ? `今天畫了 ${drawings.length} 張` : '今天畫了什麼？';
-    $('#today-count', el).textContent = drawings.length ? `已分享 ${shared} 張 · 雲端上限 ${CLOUD_MAX} 張` : '';
+    $('#today-count', el).textContent = drawings.length ? `分享中 ${shared} 張 · 同時最多 ${CLOUD_MAX} 張` : '';
     grid.innerHTML = drawings.map((d) => {
-      const s = STATUS[d.cloud] || STATUS.local;
       return `<figure class="tile">
         <button class="tile-img" data-view="${d.id}" aria-label="查看 ${formatTime(d.createdAt)} 的畫">
           <img src="${c.url(d.thumb || d.blob)}" alt="">
         </button>
-        ${d.cloud === 'synced' ? cmtBadge(d.id, counts.get(d.id) || 0) : ''}
-        ${d.cloud === 'pending'
-          ? `<button class="badge ${s.cls}" data-retry="${d.id}">${icon(s.ico, 14)}<span>${s.text}</span></button>`
-          : `<span class="badge ${s.cls}">${icon(s.ico, 14)}<span>${s.text}</span></span>`}
+        ${sharing(d) && d.cloud === 'synced' ? cmtBadge(d.id, counts.get(d.id) || 0) : ''}
+        ${shareBadge(d, { retry: true })}
         <button class="tile-save" data-save="${d.id}" aria-label="存到相簿">${icon('image', 17)}</button>
         <button class="tile-del" data-del="${d.id}" aria-label="刪除這張畫">${icon('trash', 17)}</button>
       </figure>`;
@@ -1079,7 +1138,7 @@ async function mountToday(el, c, onData = () => {}) {
         title: `今天 ${formatTime(d.createdAt)}`,
         src: c.url(d.blob),
         alt: '我今天的畫',
-        drawingId: d.cloud === 'synced' ? d.id : null,
+        drawingId: sharing(d) && d.cloud === 'synced' ? d.id : null,
         me,
         isOwner: true,
         actions: commentActions(true),
@@ -1127,8 +1186,8 @@ async function mountToday(el, c, onData = () => {}) {
     if (c.alive) noteState.textContent = '已存在本機…';
     onData();
     try {
-      if (day === dayKey()) await state.backend.saveNote({ day, note: text, expiresAt: endOfDay(day).toISOString() });
-      if (c.alive) noteState.textContent = text.trim() ? '已儲存 · 好友今天看得到' : '已儲存';
+      if (day === dayKey()) await state.backend.saveNote({ day, note: text, expiresAt: new Date(shareEnd(Date.now())).toISOString() });
+      if (c.alive) noteState.textContent = text.trim() ? '已儲存 · 好友 24 小時內看得到' : '已儲存';
     } catch (e) {
       console.warn(e);
       if (c.alive) noteState.textContent = '已存在本機 · 雲端同步失敗';
@@ -1158,7 +1217,7 @@ async function mountToday(el, c, onData = () => {}) {
 async function viewFriends(el, c, sub) {
   const tab = sub === 'list' ? 'list' : 'feed';
   el.innerHTML = `
-    <p class="muted view-sub">只看得到好友「今天」的畫，過了今天就消失。</p>
+    <p class="muted view-sub">只看得到好友 24 小時內的畫，時間到就消失。</p>
     <div class="segmented seg-wide" role="tablist">
       <a href="#/friends" role="tab" class="${tab === 'feed' ? 'on' : ''}" aria-selected="${tab === 'feed'}">今日動態</a>
       <a href="#/friends/list" role="tab" class="${tab === 'list' ? 'on' : ''}" aria-selected="${tab === 'list'}">好友名單<span class="nav-badge inline" data-badge hidden></span></a>
@@ -1212,7 +1271,7 @@ function mountRecoJoinCard(slot) {
     <span class="opt-card-ico">${icon('sparkle', 22)}</span>
     <div class="opt-card-text">
       <b>想讓更多人看到你的畫嗎？</b>
-      <p class="muted small">加入「推薦」後，不是好友的人也能在首頁看到你<b>今天</b>的畫與文字（只能看、不能留言），過了午夜就消失。可以隨時在「我的」關閉。</p>
+      <p class="muted small">加入「推薦」後，不是好友的人也能在首頁看到你 <b>24 小時內</b>的畫與文字（只能看、不能留言），時間到就消失。可以隨時在「我的」關閉。</p>
     </div>
     <div class="opt-card-actions">
       <button type="button" class="btn btn-small btn-primary" data-reco-join>加入推薦</button>
@@ -1231,7 +1290,7 @@ function mountRecoJoinCard(slot) {
         state.me = await state.backend.updateProfile({ sharePublic: true });
         markRecoCardSeen();
         slot.innerHTML = '';
-        toast('已加入推薦：非好友也能看到你今天的畫');
+        toast('已加入推薦：非好友也能看到你 24 小時內的畫');
       } catch (err) {
         console.warn(err);
         setBusy(b, false);
@@ -1561,6 +1620,17 @@ function mountPokeButton(el, c) {
   btn.addEventListener('click', () => openPokeSheet(btn));
 }
 
+/** 「今天 14:20」「昨天 23:30」「3 月 5 日 星期四 09:10」 */
+function whenLabel(ts) {
+  const k = dayKey(new Date(ts));
+  const t = formatTime(ts);
+  if (k === dayKey()) return `今天 ${t}`;
+  if (k === addDays(dayKey(), -1)) return `昨天 ${t}`;
+  return `${formatDayShort(k)} ${t}`;
+}
+/** 貼文標題旁的時間：今天只顯示時間，其他日子加上「昨天」等 */
+const metaTime = (ts) => (dayKey(new Date(ts)) === dayKey() ? formatTime(ts) : whenLabel(ts));
+
 const POKE_COOLDOWN = 12 * 36e5;
 const pokedRecently = (id) => Date.now() - (state.poked.get(id) || 0) < POKE_COOLDOWN;
 
@@ -1570,7 +1640,7 @@ const pokeRowHtml = (p, done) => `<li class="person poke-row" data-poke-row="${e
     <b>${esc(p.profile.displayName)}</b>
     <span class="muted small">@${esc(p.profile.username)}</span>
   </div>
-  ${p.posted ? '<span class="tag tag-small">今天畫了</span>' : ''}
+  ${p.posted ? '<span class="tag tag-small">有新畫</span>' : ''}
   <button type="button" class="btn btn-small poke-btn" data-poke="${esc(p.profile.id)}" ${done ? 'disabled' : ''}>${done ? '已戳' : '戳一下'}</button>
 </li>`;
 
@@ -1586,7 +1656,7 @@ async function openPokeSheet(fab) {
   let friends = [];
   try {
     const posts = await state.backend.fetchFriendsToday();
-    friends = posts.map((p) => ({ profile: p.profile, posted: !!(p.drawings.length || p.note) }))
+    friends = posts.map((p) => ({ profile: p.profile, posted: !!p.drawings.length }))
       .sort((a, b) => Number(a.posted) - Number(b.posted) || a.profile.displayName.localeCompare(b.profile.displayName, 'zh-Hant'));
   } catch (e) {
     console.warn(e);
@@ -1688,7 +1758,7 @@ function notificationsHtml(list, expanded = false) {
 /** 打開通知對應的那張畫（自己的畫從本機找，好友的畫要還看得到）；看不到就提示 */
 async function openNotificationDrawing(n) {
   const me = state.me;
-  const gone = () => toast('這張畫已經不在了，只有今天的畫看得到');
+  const gone = () => toast('這張畫已經不在了，只有 24 小時內的畫看得到');
   if (!n.drawingId) { gone(); return; }
   let rec = null;
   try { rec = await archive.getDrawing(n.drawingId); } catch { /* 找不到就當作不是自己的 */ }
@@ -1702,7 +1772,7 @@ async function openNotificationDrawing(n) {
       drawingId: rec.id,
       me,
       isOwner: true,
-      readOnly: rec.day < state.today,
+      readOnly: !sharing(rec),
       actions: commentActions(true),
       onClose: () => setTimeout(() => URL.revokeObjectURL(url), 1000),
       onSave: () => saveDrawingsToAlbum([{ blob: rec.blob, day: rec.day, n: 1 }]),
@@ -1714,9 +1784,9 @@ async function openNotificationDrawing(n) {
   try { image = URL.createObjectURL(await state.backend.fetchDrawingBlob(n.drawingId)); } catch (e) { console.warn(e); gone(); return; }
   openDrawingModal({
     onClose: () => setTimeout(() => URL.revokeObjectURL(image), 1000),
-    title: '好友的畫 · 今天',
+    title: '好友的畫',
     src: image,
-    alt: '好友今天的畫',
+    alt: '好友的畫',
     drawingId: n.drawingId,
     me,
     isOwner: false,
@@ -1746,7 +1816,7 @@ function mountNotifications(slot, c, list) {
 }
 
 /**
- * 首頁最上面「我自己」的今天：本機的今天的畫（原圖）與今日記錄，好友留言數，點圖片可看大圖與留言。
+ * 首頁最上面「我自己」的貼文：還在分享中（24 小時內）與今天的本機畫（原圖）、今日記錄，好友留言數，點圖片可看大圖與留言。
  * 還沒畫時顯示一張精簡的提示卡。repaint() 會重畫（新增圖片時由 addAndShareToday 的 onChange 呼叫）。
  */
 function mountMine(slot, c) {
@@ -1764,7 +1834,7 @@ function mountMine(slot, c) {
   };
 
   async function refreshCounts() {
-    const ids = drawings.filter((d) => d.cloud === 'synced').map((d) => d.id);
+    const ids = drawings.filter((d) => sharing(d) && d.cloud === 'synced').map((d) => d.id);
     if (!ids.length || !c.alive) return;
     const list = await loadComments(ids, { mine: true });
     if (!c.alive || list.failed) return;
@@ -1778,7 +1848,7 @@ function mountMine(slot, c) {
       return `<article class="post post-mine mine-empty">
         <div class="mine-empty-head">
           ${avatar(me, 42)}
-          <div class="post-who"><b>你今天還沒畫</b><span class="muted small">拍一張或畫一張，和朋友分享吧</span></div>
+          <div class="post-who"><b>你還沒有分享中的畫</b><span class="muted small">拍一張或畫一張，和朋友分享吧</span></div>
         </div>
         <div class="mine-empty-actions">
           ${api.photo?.canTake ? `<button type="button" class="btn btn-small" data-mine-take>${icon('camera', 18)}<span>拍照</span></button>` : ''}
@@ -1787,7 +1857,7 @@ function mountMine(slot, c) {
       </article>`;
     }
     const last = Math.max(0, ...list.map((d) => d.createdAt || 0));
-    const meta = [n ? `${n} 張畫` : '寫了一段話', last ? formatTime(last) : ''].filter(Boolean).join(' · ');
+    const meta = [n ? `${n} 張畫` : '寫了一段話', last ? metaTime(last) : ''].filter(Boolean).join(' · ');
     const single = n === 1 && !processing ? list[0] : null;
     return `<article class="post post-mine">
       <header class="post-head">
@@ -1796,11 +1866,11 @@ function mountMine(slot, c) {
       </header>
       ${n || processing ? `<div class="post-grid ${single ? 'single' : ''}">
         ${list.map((d) => {
-          const s = STATUS[d.cloud] || STATUS.local;
           return `<button class="post-img loaded" data-mine-view="${esc(d.id)}" aria-label="查看大圖與留言"
             ${single && d.width && d.height ? `style="aspect-ratio:${d.width}/${d.height}"` : ''}>
-            <img src="${k.url(d.blob)}" alt="我今天的畫">
-            ${d.cloud === 'synced' ? cmtBadge(d.id, counts.get(d.id) || 0) : `<span class="badge ${s.cls}">${icon(s.ico, 14)}<span>${d.cloud === 'pending' ? '未同步' : s.text}</span></span>`}
+            <img src="${k.url(d.blob)}" alt="我的畫">
+            ${sharing(d) && d.cloud === 'synced' ? cmtBadge(d.id, counts.get(d.id) || 0) : ''}
+            ${shareBadge(d)}
           </button>`;
         }).join('')}
         ${Array.from({ length: processing }, () => '<div class="post-img post-loading" role="status" aria-label="處理中"></div>').join('')}
@@ -1816,7 +1886,10 @@ function mountMine(slot, c) {
     let list = [];
     let note = '';
     try {
-      [list, note] = await Promise.all([archive.drawingsOfDay(me.id, day), archive.getNote(me.id, day)]);
+      // 還在分享中的畫（24 小時內，可能是昨晚發的）＋今天本機的畫
+      const recent = await recentMine();
+      list = recent.filter((d) => d.day === day || sharing(d));
+      note = await archive.getNote(me.id, day);
     } catch (e) { console.warn('own post unavailable', e); return; }
     if (!c.alive || mySeq !== seq) return; // 畫面已離開，或有更新的重畫
     const k = subCtx(c);
@@ -1839,10 +1912,10 @@ function mountMine(slot, c) {
       if (!d) return;
       const di = drawings.indexOf(d);
       openDrawingModal({
-        title: `${me.displayName} · 今天 ${formatTime(d.createdAt)}`,
+        title: `${me.displayName} · ${whenLabel(d.createdAt)}`,
         src: c.url(d.blob), // 用整個頁面的網址：重畫時不會被收掉
-        alt: '我今天的畫',
-        drawingId: d.cloud === 'synced' ? d.id : null,
+        alt: '我的畫',
+        drawingId: sharing(d) && d.cloud === 'synced' ? d.id : null,
         me,
         isOwner: true,
         actions: commentActions(true),
@@ -1856,7 +1929,7 @@ function mountMine(slot, c) {
   return api;
 }
 
-// ── 推薦貼文（非好友、同意公開分享的人今天的畫）──
+// ── 推薦貼文（非好友、同意公開分享的人 24 小時內的畫）──
 const IMG_CONCURRENCY = 3;  // 同時載入幾張好友的圖
 const RECO_SHOW = 4;        // 首頁最多顯示幾位
 const RECO_AFTER = 3;       // 規則：放在好友的第 3 則貼文之後；好友貼文不到 3 則就放在最後；沒有好友時也會顯示
@@ -1899,7 +1972,7 @@ async function addFriendFromReco(root, id) {
   for (const el of root.querySelectorAll(`[data-reco-actions="${CSS.escape(id)}"]`)) {
     el.innerHTML = `<span class="tag">${done ? '已成為好友' : '已邀請'}</span>`;
   }
-  toast(done ? '你們成為好友了！重新整理就能看到對方今天的畫' : '邀請已送出，等對方接受');
+  toast(done ? '你們成為好友了！重新整理就能看到對方的畫' : '邀請已送出，等對方接受');
   badgeAt = Date.now();
   return r;
 }
@@ -1915,7 +1988,7 @@ async function paintFeed(body, c) {
     body.innerHTML = `<div class="empty">
       <div class="empty-art">${icon('users', 34)}</div>
       <h2>還沒有好友</h2>
-      <p class="muted">加好友之後，就能看到彼此今天畫了什麼。</p>
+      <p class="muted">加好友之後，就能看到彼此 24 小時內畫了什麼。</p>
       <a class="btn btn-primary" href="#/friends/list">${icon('userPlus', 18)}<span>加好友</span></a>
     </div>
     ${recoBlock(reco)}
@@ -1928,12 +2001,12 @@ async function paintFeed(body, c) {
     body.innerHTML = `
       ${active.length ? `${active.slice(0, RECO_AFTER).map((p) => postCard(p)).join('')}${recoHtml}${active.slice(RECO_AFTER).map((p) => postCard(p)).join('')}` : `<div class="empty compact">
         <div class="empty-art">${icon('pen', 30)}</div>
-        <h2>好友們今天還沒動筆</h2>
+        <h2>好友們還沒有新畫</h2>
         <p class="muted">晚點再來看看吧，或者你先畫一張？</p>
         <a class="btn" href="#/calendar">${icon('pen', 18)}<span>去畫今天的</span></a>
       </div>${recoHtml}`}
       ${idle.length ? `<div class="idle">
-        <h3>今天還沒動筆</h3>
+        <h3>還沒有新畫</h3>
         <div class="idle-list">${idle.map((p) => `<span class="idle-person">${avatar(p.profile, 30)}<span>${esc(p.profile.displayName)}</span></span>`).join('')}</div>
       </div>` : ''}
       <div id="suggest-slot"></div>`;
@@ -1979,9 +2052,9 @@ async function paintFeed(body, c) {
       // 推薦貼文：只能看（沒有留言區），可以直接加好友
       const rid = d.reco.profile.id;
       openDrawingModal({
-        title: `${d.who} · 今天 ${formatTime(d.createdAt)}`,
+        title: `${d.who} · ${whenLabel(d.createdAt)}`,
         src: img.src,
-        alt: `${d.who} 今天的畫`,
+        alt: `${d.who} 的畫`,
         me: state.me,
         isOwner: false,
         onAddFriend: () => addFriendFromReco(body, rid),
@@ -1989,9 +2062,9 @@ async function paintFeed(body, c) {
       return;
     }
     openDrawingModal({
-      title: `${d?.who || ''} · 今天 ${d ? formatTime(d.createdAt) : ''}`,
+      title: `${d?.who || ''} · ${d ? whenLabel(d.createdAt) : ''}`,
       src: img.src,
-      alt: `${d?.who || ''} 今天的畫`,
+      alt: `${d?.who || ''} 的畫`,
       drawingId: id,
       me: state.me,
       isOwner: false,
@@ -2058,7 +2131,7 @@ async function paintFeed(body, c) {
 function postCard(p, { reco = false } = {}) {
   const n = p.drawings.length;
   const reason = reco && p.mutualCount > 0 ? `${p.mutualCount} 位共同好友` : '';
-  const meta = [n ? `${n} 張畫` : '寫了一段話', p.lastAt ? formatTime(p.lastAt) : '', reason].filter(Boolean).join(' · ');
+  const meta = [n ? `${n} 張畫` : '寫了一段話', p.lastAt ? metaTime(p.lastAt) : '', reason].filter(Boolean).join(' · ');
   const single = n === 1 ? p.drawings[0] : null;
   const id = p.profile.id;
   return `<article class="post ${reco ? 'post-reco' : ''}">
@@ -2069,7 +2142,7 @@ function postCard(p, { reco = false } = {}) {
     ${n ? `<div class="post-grid ${single ? 'single' : ''}">
       ${p.drawings.map((d) => `<button class="post-img" data-cloud-view="${esc(d.id)}" aria-label="${reco ? '查看大圖' : '查看大圖與留言'}"
           ${single && d.width && d.height ? `style="aspect-ratio:${d.width}/${d.height}"` : ''}>
-          <img data-cloud-id="${esc(d.id)}" alt="${esc(p.profile.displayName)} 今天的畫">
+          <img data-cloud-id="${esc(d.id)}" alt="${esc(p.profile.displayName)} 的畫">
           ${reco ? '' : cmtBadge(d.id, 0, true)}
         </button>`).join('')}
     </div>` : ''}
@@ -2161,7 +2234,7 @@ function onFeedSuggestClick(e) {
     state.backend.sendFriendRequest(b.dataset.suggestAdd).then((r) => {
       const done = r === 'accepted' || r === 'already_friends';
       $('.suggest-actions', card).innerHTML = `<span class="tag">${done ? '已成為好友' : '已邀請'}</span>`;
-      toast(done ? '你們成為好友了！重新整理就能看到對方今天的畫' : '邀請已送出，等對方接受');
+      toast(done ? '你們成為好友了！重新整理就能看到對方的畫' : '邀請已送出，等對方接受');
       badgeAt = Date.now();
     }).catch((err) => {
       console.warn(err);
@@ -2302,7 +2375,7 @@ async function paintFriendList(body, c) {
         setBusy(b, true);
         await state.backend.removeFriend(d.decline || d.cancel);
       } else if (d.remove) {
-        if (!(await confirmDialog(`確定要移除「${d.name}」嗎？你們將看不到彼此今天的畫。`, { ok: '移除', danger: true }))) return;
+        if (!(await confirmDialog(`確定要移除「${d.name}」嗎？你們將看不到彼此的畫。`, { ok: '移除', danger: true }))) return;
         await state.backend.removeFriend(d.remove);
         toast('已移除');
       } else return;
@@ -2479,10 +2552,10 @@ function mountPastDay(el, c, day, list, note, { onBack, onData }) {
       </div>
       <button class="btn btn-small" data-back>${icon('sun', 18)}<span>回到今天</span></button>
     </section>
-    <p class="chip chip-quiet">${icon('device', 16)}<span>這天的畫只保存在這台裝置</span></p>
+    <p class="chip chip-quiet" id="past-chip"></p>
     ${list.length ? `<div class="sheet-grid">${list.map((d, i) => `
       <figure class="sheet-item">
-        <button class="sheet-img" data-open="${i}" aria-label="查看大圖"><img src="${thumbs[i]}" alt="${formatTime(d.createdAt)} 的畫"></button>
+        <button class="sheet-img" data-open="${i}" aria-label="查看大圖"><img src="${thumbs[i]}" alt="${formatTime(d.createdAt)} 的畫">${sharing(d) ? shareBadge(d) : ''}</button>
         <figcaption>
           <span class="muted small">${formatTime(d.createdAt)}${d.source === 'sketch' ? ' · 隨手畫' : ''}</span>
           <span class="sheet-actions">
@@ -2494,6 +2567,18 @@ function mountPastDay(el, c, day, list, note, { onBack, onData }) {
         <ul class="comment-list compact sheet-comments" data-cmts="${esc(d.id)}" aria-label="好友的留言" hidden></ul>
       </figure>`).join('')}</div>` : ''}
     ${note ? `<div class="sheet-note"><p class="eyebrow">文字記錄</p><p>${esc(note)}</p></div>` : ''}`;
+
+  // 上方的提示：還有畫在分享（例如昨晚發的、24 小時還沒到）就說還在分享中，否則說只在這台裝置
+  const chip = $('#past-chip', el);
+  const paintChip = () => {
+    const n = list.filter((d) => sharing(d)).length;
+    chip.classList.toggle('chip-quiet', !n);
+    chip.innerHTML = n
+      ? `${icon('cloud', 16)}<span>有 ${n} 張還在分享中</span>`
+      : `${icon('device', 16)}<span>這天的畫只保存在這台裝置</span>`;
+  };
+  paintChip();
+  c.every(() => { if (tickShare(el) > 0) { expireMine(); paintChip(); } }, 30_000);
 
   // 好友在這些畫上留的字：先用本機快取，再向雲端更新（沒有留言就什麼都不顯示）
   const paintComments = (all) => {
@@ -2527,7 +2612,7 @@ function mountPastDay(el, c, day, list, note, { onBack, onData }) {
         drawingId: d.id,
         me: state.me,
         isOwner: true,
-        readOnly: true,
+        readOnly: !sharing(d),
         actions: commentActions(true),
         onSave: () => saveDrawingsToAlbum([{ blob: d.blob, day, n: i + 1 }]),
         onDownload: () => downloadBlob(d.blob, fname),
@@ -2708,7 +2793,7 @@ async function viewMe(el, c) {
       <h2>推薦</h2>
       <div class="card stack">
         ${shareSwitchHtml(me.sharePublic, 'data-share-public')}
-        <p class="field-hint">只有「今天」的畫與文字會被看到，過了午夜就消失；對方只能看，不能留言。關閉後，不是好友的人就看不到你的畫了。</p>
+        <p class="field-hint">只有 24 小時內的畫與文字會被看到，時間到就消失；對方只能看，不能留言。關閉後，不是好友的人就看不到你的畫了。</p>
       </div>
     </section>` : ''}
 
@@ -2788,9 +2873,9 @@ async function viewMe(el, c) {
     <section class="section">
       <h2>Art Day 的規則</h2>
       <ul class="rules compact">
-        <li><span class="rule-ico">${icon('users')}</span><div><b>加好友</b><span>互相成為好友，就能看到對方今天畫的圖和文字。</span></div></li>
-        <li><span class="rule-ico">${icon('hourglass')}</span><div><b>只有今天</b><span>好友只看得到今天的，過了午夜就看不到了。</span></div></li>
-        <li><span class="rule-ico">${icon('cloud')}</span><div><b>雲端只放今天</b><span>今天的畫會上傳一份到雲端，隔天自動刪除，節省空間。</span></div></li>
+        <li><span class="rule-ico">${icon('users')}</span><div><b>加好友</b><span>互相成為好友，就能看到對方 24 小時內畫的圖和文字。</span></div></li>
+        <li><span class="rule-ico">${icon('hourglass')}</span><div><b>只有 24 小時</b><span>好友只看得到你發佈後 24 小時內的畫，時間到就看不到了。</span></div></li>
+        <li><span class="rule-ico">${icon('cloud')}</span><div><b>雲端只放 24 小時</b><span>每張畫會上傳一份到雲端，從上傳起 24 小時後自動刪除，節省空間；你手機裡的原圖不會消失。</span></div></li>
         <li><span class="rule-ico">${icon('device')}</span><div><b>畫留在身邊</b><span>每一張都永久存在你的裝置，在「日曆」裡隨時翻看。</span></div></li>
       </ul>
     </section>
@@ -2837,7 +2922,7 @@ async function viewMe(el, c) {
       try {
         state.me = await state.backend.updateProfile({ sharePublic: t.checked });
         markRecoCardSeen();
-        toast(t.checked ? '已加入推薦：非好友也能看到你今天的畫' : '已關閉推薦');
+        toast(t.checked ? '已加入推薦：非好友也能看到你 24 小時內的畫' : '已關閉推薦');
       } catch (err) {
         console.warn(err);
         t.checked = !t.checked; // 沒存成功：開關退回去

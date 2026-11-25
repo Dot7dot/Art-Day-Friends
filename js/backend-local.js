@@ -1,9 +1,9 @@
 // 本機示範模式：不需要任何伺服器。
 // 帳號、好友與「共用雲端」都模擬在這台裝置的瀏覽器裡，並附上幾位示範好友。
-// 規則與真正的雲端版一致：好友只看得到今天的畫，過了今天就從「雲端」移除。
+// 規則與真正的雲端版一致：每張畫從上傳起分享 24 小時，時間到就從「雲端」移除。
 
 import { openDB, promisify, run } from './idb.js';
-import { dayKey, endOfDay } from './dates.js';
+import { dayKey, parseDay, SHARE_MS } from './dates.js';
 import { demoArt } from './demo-art.js';
 import { dataURLToBlob } from './imaging.js';
 import { recoverySecret, MAX_FAILED_ATTEMPTS } from './recovery.js';
@@ -119,24 +119,24 @@ export async function createLocalBackend() {
   const nowIso = () => new Date().toISOString();
 
   async function ensureDemoPosts(day) {
-    const expiresAt = endOfDay(day).toISOString();
     const n = Number(day.replaceAll('-', ''));
     for (const a of DEMO_ARTISTS) {
       if (!a.posts(day)) continue;
       const existing = await run(cloud, 'drawings', 'readonly', ({ drawings }) => promisify(drawings.index('byUser').getAll(a.id)));
       if (existing.some((d) => d.day === day)) continue;
       const count = 1 + (n % 2);
-      const startOfDay = endOfDay(day).getTime() - 864e5;
+      const startOfDay = parseDay(day).getTime();
       const base = Math.max(startOfDay + 60_000, Date.now() - 1000 * 60 * (40 + (n % 200)));
       await run(cloud, ['drawings', 'notes'], 'readwrite', ({ drawings, notes }) => {
         for (let i = 0; i < count; i++) {
           drawings.put({
             id: `${a.id}-${day}-${i}`, userId: a.id, day, width: 600, height: 600,
             image: demoArt(`${a.id}:${day}:${i}`, a.themes[(n + i) % a.themes.length]),
-            createdAt: new Date(base + i * 1000 * 60 * 25).toISOString(), expiresAt,
+            createdAt: new Date(base + i * 1000 * 60 * 25).toISOString(),
+            expiresAt: new Date(base + i * 1000 * 60 * 25 + SHARE_MS).toISOString(), // 上傳起 24 小時
           });
         }
-        notes.put({ userId: a.id, day, note: a.notes[n % a.notes.length], updatedAt: new Date(base).toISOString(), expiresAt });
+        notes.put({ userId: a.id, day, note: a.notes[n % a.notes.length], updatedAt: new Date(base).toISOString(), expiresAt: new Date(base + SHARE_MS).toISOString() });
       });
     }
   }
@@ -403,7 +403,7 @@ export async function createLocalBackend() {
     },
 
     /**
-     * 推薦貼文（規則同雲端版 recommended_posts）：同意公開、不是我、沒有任何好友關係、今天有畫。
+     * 推薦貼文（規則同雲端版 recommended_posts）：同意公開、不是我、沒有任何好友關係、24 小時內有畫。
      * 共同好友多的在前，再依最近發佈時間。回傳和 fetchFriendsToday 一樣的貼文格式，多一個 mutualCount。
      */
     async recommendedPosts(limit = 6) {
@@ -457,15 +457,24 @@ export async function createLocalBackend() {
       write(K_FRIENDS, friendships().filter((x) => !((x.requester === me.id && x.addressee === otherId) || (x.requester === otherId && x.addressee === me.id))));
     },
 
-    async uploadDrawing({ id, day, image, width, height, expiresAt }) {
-      await run(cloud, 'drawings', 'readwrite', ({ drawings }) => promisify(drawings.put({
-        id, userId: me.id, day, image, width, height, createdAt: nowIso(), expiresAt,
-      })));
+    async uploadDrawing({ id, day, image, width, height }) {
+      // 和雲端版一樣：期限由「資料庫」固定為現在起 24 小時，不採用前端送來的值；同時最多 6 張在分享中
+      const t = Date.now();
+      const expiresAt = await run(cloud, 'drawings', 'readwrite', async ({ drawings }) => {
+        const mine = await promisify(drawings.index('byUser').getAll(me.id));
+        const dup = mine.find((d) => d.id === id);
+        if (dup) return dup.expiresAt;
+        if (mine.filter((d) => d.expiresAt > new Date(t).toISOString()).length >= 6) throw new Error('雲端同時分享的張數已達上限（6 張）');
+        const exp = new Date(t + SHARE_MS).toISOString();
+        drawings.put({ id, userId: me.id, day, image, width, height, createdAt: new Date(t).toISOString(), expiresAt: exp });
+        return exp;
+      });
       // 讓示範更有感：過幾秒，示範好友就會來留言
       const owner = me.id;
       setTimeout(() => {
         if (me?.id === owner) getDrawing(id).then((d) => d && ensureCannedComments([d])).catch(() => {});
       }, 4000);
+      return expiresAt;
     },
 
     async deleteDrawing(id) {
@@ -498,8 +507,8 @@ export async function createLocalBackend() {
       body = String(body ?? '').trim();
       if (!body || body.length > COMMENT_MAX) throw new Error(`留言需要 1–${COMMENT_MAX} 個字`);
       const d = await getDrawing(drawingId);
-      if (!d || d.expiresAt <= nowIso()) throw new Error('這張畫已經過了今天，不能再留言了');
-      if (d.userId !== me.id && !isFriend(d.userId, me.id)) throw new Error('只有好友可以在今天的畫上留言');
+      if (!d || d.expiresAt <= nowIso()) throw new Error('這張畫已經超過 24 小時，不能再留言了');
+      if (d.userId !== me.id && !isFriend(d.userId, me.id)) throw new Error('只有好友可以在還在分享中的畫上留言');
       const mine = await run(cloud, 'comments', 'readonly', ({ comments }) => promisify(comments.index('byDrawing').getAll(drawingId)));
       if (mine.filter((c) => c.author === me.id).length >= COMMENT_CAP) throw new Error('你在這張畫上的留言已經太多了，先到這裡吧');
       const parent = replyTo ? mine.find((c) => c.id === replyTo) : null; // 回覆的對象必須在同一張畫上
@@ -523,23 +532,25 @@ export async function createLocalBackend() {
       });
     },
 
-    async saveNote({ day, note, expiresAt }) {
+    async saveNote({ day, note }) {
+      // 最後一次儲存後再分享 24 小時（同雲端版的 guard_note）
       await run(cloud, 'notes', 'readwrite', ({ notes }) => promisify(
-        note.trim() ? notes.put({ userId: me.id, day, note, updatedAt: nowIso(), expiresAt }) : notes.delete([me.id, day]),
+        note.trim() ? notes.put({ userId: me.id, day, note, updatedAt: nowIso(), expiresAt: new Date(Date.now() + SHARE_MS).toISOString() }) : notes.delete([me.id, day]),
       ));
     },
 
-    async fetchMyToday(day) {
+    /** 我自己還在分享中（24 小時內）的畫與文字，不分哪一天（給別台裝置同步用） */
+    async fetchMyLive() {
       const now = nowIso();
-      const [ds, n] = await run(cloud, ['drawings', 'notes'], 'readonly', ({ drawings, notes }) => Promise.all([
+      const [ds, ns] = await run(cloud, ['drawings', 'notes'], 'readonly', ({ drawings, notes }) => Promise.all([
         promisify(drawings.index('byUser').getAll(me.id)),
-        promisify(notes.get([me.id, day])),
+        promisify(notes.getAll(IDBKeyRange.bound([me.id, ''], [me.id, '￿']))),
       ]));
-      const live = ds.filter((d) => d.day === day && d.expiresAt > now);
+      const live = ds.filter((d) => d.expiresAt > now);
       await ensureCannedComments(live);
       return {
-        drawings: live.map(({ id, width, height, createdAt }) => ({ id, width, height, createdAt })),
-        note: n && n.expiresAt > now ? n.note : '',
+        drawings: live.map(({ id, day, width, height, createdAt, expiresAt }) => ({ id, day, width, height, createdAt, expiresAt })),
+        notes: ns.filter((n) => n.expiresAt > now).map((n) => ({ day: n.day, note: n.note })),
       };
     },
 
