@@ -7,6 +7,7 @@ import { dayKey, parseDay, SHARE_MS } from './dates.js';
 import { demoArt } from './demo-art.js';
 import { dataURLToBlob } from './imaging.js';
 import { recoverySecret, MAX_FAILED_ATTEMPTS } from './recovery.js';
+import { FRAMES, getFrame } from './frames.js';
 
 const K_USERS = 'artday.demo.users';
 const K_SESSION = 'artday.demo.session';
@@ -18,16 +19,19 @@ const K_WISHES = 'artday.demo.wishes'; // 許願池（只存在這台裝置）
 const K_CHEERS = 'artday.demo.cheers'; // 打氣區（只存在這台裝置，保留 3 天）
 const K_CHEERS_SEEDED = 'artday.demo.cheersSeeded';
 const K_POKE_LOG = 'artday.demo.pokeLog'; // 戳的紀錄（頻率限制用，收件人刪通知也不影響）
+const K_HEARTS = 'artday.demo.hearts';       // [{ drawingId, owner, liker, createdAt }]（永久保留，和雲端一樣）
+const K_FRAME_UNLOCKS = 'artday.demo.frameUnlocks'; // [{ user, frame, source, at }]
+const K_ACTIVITY = 'artday.demo.activity';   // [{ user, kind, day }]
 const K_POKE_DAY = 'artday.demo.pokeDay'; // { 使用者id: 示範好友最近一次來戳的日期 }
 
 const DEMO_ARTISTS = [
   {
-    id: 'demo-momo', username: 'momo_draws', displayName: '桃桃', themes: [1, 2],
+    id: 'demo-momo', username: 'momo_draws', displayName: '桃桃', frame: 'peach', themes: [1, 2],
     notes: ['今天用了新買的橘色代針筆，線條好順。', '下午的光很好，畫了窗邊的植物。', '只畫了十分鐘，但很開心。', '試著不打草稿直接畫！'],
     posts: () => true,
   },
   {
-    id: 'demo-ashu', username: 'ashu_sketch', displayName: '阿樹', themes: [0, 3],
+    id: 'demo-ashu', username: 'ashu_sketch', displayName: '阿樹', frame: 'waves', themes: [0, 3],
     notes: ['通勤時的速寫。', '今天的主題：圓形。', '畫畫是今天最安靜的時刻。', '顏色亂配也很可愛。'],
     posts: () => true,
   },
@@ -37,7 +41,7 @@ const DEMO_ARTISTS = [
     posts: (day) => Number(day.slice(-2)) % 2 === 0,
   },
   {
-    id: 'demo-nana', username: 'nana_paint', displayName: '娜娜', themes: [2, 1],
+    id: 'demo-nana', username: 'nana_paint', displayName: '娜娜', frame: 'purple', themes: [2, 1],
     notes: ['今天試了水彩暈染。', '用咖啡漬當底色，意外好看。', '小小的一張，慢慢畫。'],
     posts: () => true, // 每天都畫、也不會自動成為好友：用來示範「推薦貼文」
   },
@@ -96,7 +100,9 @@ export async function createLocalBackend() {
   // 確保示範好友存在
   const users = read(K_USERS, []);
   for (const a of DEMO_ARTISTS) {
-    if (!users.some((u) => u.id === a.id)) users.push({ id: a.id, username: a.username, displayName: a.displayName, demo: true, createdAt: `2024-01-0${DEMO_ARTISTS.indexOf(a) + 1}T00:00:00.000Z` });
+    const have = users.find((u) => u.id === a.id);
+    if (have && a.frame && !('frame' in have)) have.frame = a.frame;
+    if (!have) users.push({ id: a.id, username: a.username, displayName: a.displayName, frame: a.frame, demo: true, createdAt: `2024-01-0${DEMO_ARTISTS.indexOf(a) + 1}T00:00:00.000Z` });
   }
   write(K_USERS, users);
   {
@@ -113,7 +119,7 @@ export async function createLocalBackend() {
   let me = null;
   const allUsers = () => read(K_USERS, []);
   // 推薦設定：示範畫家預設都同意公開（demo）；一般使用者預設不公開，要自己開
-  const profile = (u) => u && { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar || null, demo: !!u.demo, sharePublic: u.demo ? u.sharePublic !== false : !!u.sharePublic };
+  const profile = (u) => u && { id: u.id, username: u.username, displayName: u.displayName, avatar: u.avatar || null, frame: u.frame || null, demo: !!u.demo, sharePublic: u.demo ? u.sharePublic !== false : !!u.sharePublic };
   const byId = (id) => profile(allUsers().find((u) => u.id === id));
   const friendships = () => read(K_FRIENDS, []);
   const nowIso = () => new Date().toISOString();
@@ -156,6 +162,59 @@ export async function createLocalBackend() {
 
   const hashStr = (str) => [...str].reduce((h, ch) => (h * 31 + ch.codePointAt(0)) >>> 0, 7);
   const getDrawing = (id) => run(cloud, 'drawings', 'readonly', ({ drawings }) => promisify(drawings.get(id)));
+  const unlocks = () => read(K_FRAME_UNLOCKS, []);
+  const activity = () => read(K_ACTIVITY, []);
+  const addActivity = (user, kind, day) => {
+    const list = activity();
+    if (list.some((a) => a.user === user && a.kind === kind && a.day === day)) return;
+    write(K_ACTIVITY, [...list, { user, kind, day }]);
+  };
+  const taipeiDay = (t = Date.now()) => new Date(t + 8 * 36e5).toISOString().slice(0, 10); // 留言連續天數以台灣時間算（同雲端版）
+  const hearts = () => read(K_HEARTS, []);
+  const spentOf = (uid) => unlocks().filter((x) => x.user === uid && x.source === 'purchase').reduce((n, x) => n + (getFrame(x.frame)?.price || 0), 0);
+  const heartsOf = (uid) => {
+    const received = hearts().filter((h) => h.owner === uid).length;
+    const spent = spentOf(uid);
+    return { received, spent, available: received - spent };
+  };
+  const streak7 = (uid, kind) => {
+    const days = [...new Set(activity().filter((a) => a.user === uid && a.kind === kind).map((a) => a.day))].sort();
+    let run = 0;
+    for (let i = 0; i < days.length; i++) {
+      run = i && Date.parse(days[i]) - Date.parse(days[i - 1]) === 864e5 ? run + 1 : 1;
+      if (run >= 7) return true;
+    }
+    return false;
+  };
+
+  /** 示範：我的好友裡的示範畫家，會陸續給我還在分享中的畫愛心（每張 1–3 顆，隔一陣子來一顆） */
+  async function ensureDemoHearts(drawings) {
+    const artists = DEMO_ARTISTS.filter((a) => isFriend(a.id, me.id));
+    if (!artists.length) return;
+    const list = hearts();
+    let changed = false;
+    for (const d of drawings) {
+      const h = hashStr(d.id);
+      const n = 1 + (h % 3);
+      const order = [...artists].sort((a, b) => hashStr(a.id + d.id) - hashStr(b.id + d.id));
+      const created = Date.parse(d.createdAt);
+      for (let i = 0; i < Math.min(n, order.length); i++) {
+        const due = created + 8000 + i * 25000 + (h % 7) * 1000; // 示範用：幾秒～一分鐘內陸續收到
+        const at = Math.min(Date.now(), Date.parse(d.expiresAt));
+        if (due > at) continue;
+        if (list.some((x) => x.drawingId === d.id && x.liker === order[i].id)) continue;
+        list.push({ drawingId: d.id, owner: me.id, liker: order[i].id, createdAt: new Date(due).toISOString() });
+        changed = true;
+      }
+    }
+    if (changed) write(K_HEARTS, list);
+  }
+  const myLiveDrawings = async () => {
+    const now = nowIso();
+    const ds = await run(cloud, 'drawings', 'readonly', ({ drawings }) => promisify(drawings.index('byUser').getAll(me.id)));
+    return ds.filter((d) => d.expiresAt > now);
+  };
+
   const isFriend = (a, b) => friendships().some((f) => f.status === 'accepted'
     && ((f.requester === a && f.addressee === b) || (f.requester === b && f.addressee === a)));
   const pubComment = (c) => ({
@@ -268,12 +327,17 @@ export async function createLocalBackend() {
     },
 
     /** displayName、avatar（data URL，或 null 代表移除）、sharePublic 都是選填，沒給的就不動 */
-    async updateProfile({ displayName, avatar, sharePublic } = {}) {
+    async updateProfile({ displayName, avatar, sharePublic, frame } = {}) {
       write(K_USERS, allUsers().map((u) => {
         if (u.id !== me.id) return u;
         const next = { ...u };
         if (displayName !== undefined) next.displayName = displayName;
         if (sharePublic !== undefined) next.sharePublic = !!sharePublic;
+        if (frame !== undefined) {
+          // 同雲端版的觸發器：只能用自己擁有的外框（或取消）
+          if (frame !== null && !unlocks().some((x) => x.user === me.id && x.frame === frame)) throw new Error('這個外框還沒解鎖');
+          if (frame === null) delete next.frame; else next.frame = frame;
+        }
         if (avatar !== undefined) {
           if (avatar === null) delete next.avatar;
           else if (/^data:image\/(jpeg|png|webp);base64,/.test(avatar) && avatar.length <= 60000) next.avatar = avatar;
@@ -469,6 +533,7 @@ export async function createLocalBackend() {
         drawings.put({ id, userId: me.id, day, image, width, height, createdAt: new Date(t).toISOString(), expiresAt: exp });
         return exp;
       });
+      addActivity(me.id, 'upload', day);
       // 讓示範更有感：過幾秒，示範好友就會來留言
       const owner = me.id;
       setTimeout(() => {
@@ -515,6 +580,7 @@ export async function createLocalBackend() {
       if (replyTo && !parent) throw new Error('你要回覆的那則留言已經不見了');
       const c = { id: `c-${randomHex(8)}`, drawingId, drawingOwner: d.userId, author: me.id, day: d.day, body, createdAt: nowIso(), replyTo: parent ? parent.id : null };
       await putCloudComment(c);
+      if (d.userId !== me.id) addActivity(me.id, 'comment_other', taipeiDay());
       // 回覆別人 → 通知對方（回覆自己不通知）
       if (parent && parent.author !== me.id) addNotif({ recipient: parent.author, actor: me.id, kind: 'reply', drawingId, commentId: c.id });
       return pubComment(c);
@@ -679,6 +745,79 @@ export async function createLocalBackend() {
 
     async purgeMyPast() {
       await purgeExpired();
+    },
+
+    // ── 愛心（規則同雲端版：只能給好友或公開的人、還在分享中的畫；一人一顆；不能給自己；只有畫的主人看得到數量）──
+
+    async likedIds(ids) {
+      const set = new Set(ids);
+      return new Set(hearts().filter((h) => h.liker === me.id && set.has(h.drawingId)).map((h) => h.drawingId));
+    },
+
+    async setHeart(drawingId, on) {
+      const d = await getDrawing(drawingId);
+      if (!d || d.expiresAt <= nowIso()) throw Object.assign(new Error('這張畫已經超過 24 小時，或不能給愛心'), { code: 'HEART_REFUSED' });
+      const list = hearts();
+      const has = list.some((h) => h.drawingId === drawingId && h.liker === me.id);
+      if (!on) {
+        if (has) write(K_HEARTS, list.filter((h) => !(h.drawingId === drawingId && h.liker === me.id)));
+        return false;
+      }
+      if (d.userId === me.id || !(isFriend(d.userId, me.id) || byId(d.userId)?.sharePublic)) {
+        throw Object.assign(new Error('這張畫已經超過 24 小時，或不能給愛心'), { code: 'HEART_REFUSED' });
+      }
+      if (!has) write(K_HEARTS, [...list, { drawingId, owner: d.userId, liker: me.id, createdAt: nowIso() }]);
+      return true;
+    },
+
+    async myHearts() {
+      await ensureDemoHearts(await myLiveDrawings());
+      return heartsOf(me.id);
+    },
+
+    async myDrawingHearts(ids) {
+      await ensureDemoHearts(await myLiveDrawings());
+      const set = new Set(ids);
+      const out = new Map();
+      for (const h of hearts()) if (h.owner === me.id && set.has(h.drawingId)) out.set(h.drawingId, (out.get(h.drawingId) || 0) + 1);
+      return out;
+    },
+
+    // ── 外框 ──
+
+    async frameStatus() {
+      return Object.fromEntries(unlocks().filter((x) => x.user === me.id).map((x) => [x.frame, x.source]));
+    },
+
+    async buyFrame(id) {
+      const f = getFrame(id);
+      if (!f || f.group !== 'shop') return 'not_for_sale';
+      if (unlocks().some((x) => x.user === me.id && x.frame === id)) return 'already_owned';
+      if (heartsOf(me.id).available < f.price) return 'not_enough_hearts';
+      write(K_FRAME_UNLOCKS, [...unlocks(), { user: me.id, frame: id, source: 'purchase', at: nowIso() }]);
+      return 'ok';
+    },
+
+    async claimFrameAchievements(localDay) {
+      const t = dayKey(); // 示範沒有「伺服器日期」：以這台裝置今天為準，前後一天內才記
+      if (localDay && Math.abs(Date.parse(localDay) - Date.parse(t)) <= 864e5) addActivity(me.id, 'visit', localDay);
+      const mine = activity().filter((a) => a.user === me.id);
+      const days = new Set(mine.map((a) => a.day));
+      const comments = await run(cloud, 'comments', 'readonly', ({ comments: c }) => promisify(c.getAll()));
+      const u = allUsers().find((x) => x.id === me.id);
+      const ok = {
+        black: true,
+        white: !!u?.recovery,
+        blue: mine.some((a) => a.kind === 'upload'),
+        green: comments.some((c) => c.author === me.id),
+        orange: days.size >= 4,
+        flowers: streak7(me.id, 'upload'),
+        grass: streak7(me.id, 'comment_other'),
+      };
+      const have = new Set(unlocks().filter((x) => x.user === me.id).map((x) => x.frame));
+      const fresh = FRAMES.filter((f) => f.group === 'achievement' && ok[f.id] && !have.has(f.id)).map((f) => f.id);
+      if (fresh.length) write(K_FRAME_UNLOCKS, [...unlocks(), ...fresh.map((frame) => ({ user: me.id, frame, source: 'achievement', at: nowIso() }))]);
+      return fresh;
     },
   };
   return api;

@@ -15,6 +15,8 @@
 --  • 留言可以回覆別人（reply_to）；被回覆的人與被「戳」的人會收到通知（notifications）。
 --  • 許願池（wishes）：使用者許願新功能，只有本人看得到自己的願望，網站管理員在 Dashboard 看全部。
 --  • 打氣區（cheers）：登入的使用者互相留言打氣，每則保留 3 天，本人可編輯、刪除。
+--  • 愛心（drawing_likes）：對好友（或公開）還在分享中的畫按愛心；愛心永久累積，只有畫的主人看得到總數，
+--    可以用來購買頭像外框。外框（frames）：20 款，7 款靠成就解鎖，13 款用愛心購買，全部由資料庫判斷。
 -- ════════════════════════════════════════════════════════════════
 
 
@@ -31,6 +33,12 @@ alter table public.profiles add column if not exists avatar text;
 alter table public.profiles drop constraint if exists profiles_avatar_check;
 alter table public.profiles add constraint profiles_avatar_check
   check (avatar is null or (avatar ~ '^data:image/(jpeg|png|webp);base64,' and char_length(avatar) <= 60000));
+
+-- 頭像外框：目前戴的外框 id（空值 = 沒有外框）。只能設成自己擁有的外框（見第 10 節的觸發器）
+alter table public.profiles add column if not exists frame text;
+alter table public.profiles drop constraint if exists profiles_frame_check;
+alter table public.profiles add constraint profiles_frame_check
+  check (frame is null or frame ~ '^[a-z0-9_]{1,24}$');
 
 -- 推薦貼文：同意「非好友也能看到我 24 小時內的畫」。預設 false（要使用者自己開啟）
 alter table public.profiles add column if not exists share_public boolean not null default false;
@@ -52,7 +60,7 @@ create policy "profiles: update own" on public.profiles
 revoke all on public.profiles from anon;
 revoke update on public.profiles from authenticated;
 grant select, insert on public.profiles to authenticated;
-grant update (display_name, avatar, share_public) on public.profiles to authenticated;   -- 只能改暱稱、大頭貼與推薦設定，不能改 ID
+grant update (display_name, avatar, share_public, frame) on public.profiles to authenticated;   -- 只能改暱稱、大頭貼、推薦設定與外框，不能改 ID
 
 -- 註冊時自動建立個人檔案（從註冊表單帶來的 username / display_name）
 create or replace function public.handle_new_user()
@@ -220,7 +228,7 @@ grant execute on function public.is_public_profile(uuid) to authenticated;
 -- （回傳欄位多了 avatar；create or replace 不能改回傳型態，所以先 drop，下面再重新授權）
 drop function if exists public.suggest_friends(int);
 create function public.suggest_friends(max_count int default 8)
-returns table (id uuid, username text, display_name text, avatar text, mutual_count int)
+returns table (id uuid, username text, display_name text, avatar text, frame text, mutual_count int)
 language plpgsql
 stable
 security definer
@@ -249,7 +257,7 @@ begin
        and me not in (f.requester, f.addressee)
      group by 1
   )
-  select p.id, p.username, p.display_name, p.avatar, coalesce(m.n, 0)::int as mutual_count
+  select p.id, p.username, p.display_name, p.avatar, p.frame, coalesce(m.n, 0)::int as mutual_count
     from public.profiles p
     left join mutual m on m.cid = p.id
    where p.id <> me
@@ -400,7 +408,7 @@ alter table public.day_notes enable trigger day_notes_guard;
 -- （不會用到 drawings 的 RLS：security definer 在資料庫內算，圖片仍由前端用一般查詢讀取）
 drop function if exists public.recommended_posts(int);
 create function public.recommended_posts(max_count int default 6)
-returns table (user_id uuid, username text, display_name text, avatar text,
+returns table (user_id uuid, username text, display_name text, avatar text, frame text,
                mutual_count int, drawing_count int, last_at timestamptz)
 language plpgsql
 stable
@@ -436,7 +444,7 @@ begin
      where d.expires_at > now()
      group by d.user_id
   )
-  select p.id, p.username, p.display_name, p.avatar,
+  select p.id, p.username, p.display_name, p.avatar, p.frame,
          coalesce(m.n, 0)::int, l.cnt, l.last_at
     from public.profiles p
     join live l on l.uid = p.id
@@ -1377,3 +1385,390 @@ end;
 $$;
 
 revoke execute on function public.admin_delete_cheer(uuid) from public, anon, authenticated;
+
+
+-- ════════════════════════════════════════════════════════════════
+-- 9. 愛心
+-- ════════════════════════════════════════════════════════════════
+--  • 對「好友（或同意公開分享的人）還在分享中」的畫按愛心；一人一張畫一顆，按第二次 = 收回（只有畫還在分享中才能收回）。
+--  • 不能給自己的畫。愛心永久保留（畫被清掉後也在），所以 drawing_id 刻意不設外鍵。
+--  • 只有按愛心的人讀得到自己按過的；畫的主人只能透過 my_hearts() / my_drawing_hearts() 看到「數量」，
+--    不知道是誰按的，別人完全看不到數量。
+create table if not exists public.drawing_likes (
+  drawing_id    uuid not null,
+  drawing_owner uuid not null references public.profiles (id) on delete cascade,
+  liker         uuid not null default auth.uid() references public.profiles (id) on delete cascade,
+  created_at    timestamptz not null default now(),
+  primary key (drawing_id, liker)
+);
+
+create index if not exists drawing_likes_owner_idx on public.drawing_likes (drawing_owner);
+
+alter table public.drawing_likes enable row level security;
+
+drop policy if exists "likes: read own" on public.drawing_likes;
+create policy "likes: read own" on public.drawing_likes
+  for select to authenticated using (liker = (select auth.uid()));
+
+drop policy if exists "likes: insert friend or public live" on public.drawing_likes;
+create policy "likes: insert friend or public live" on public.drawing_likes
+  for insert to authenticated
+  with check (
+    liker = (select auth.uid())
+    and public.drawing_is_live(drawing_id)
+    and (public.is_my_friend(drawing_owner) or public.is_public_profile(drawing_owner))
+  );
+
+drop policy if exists "likes: delete own while live" on public.drawing_likes;
+create policy "likes: delete own while live" on public.drawing_likes
+  for delete to authenticated
+  using (liker = (select auth.uid()) and public.drawing_is_live(drawing_id));
+
+revoke all on public.drawing_likes from public, anon, authenticated;
+grant select, insert, delete on public.drawing_likes to authenticated;   -- 沒有 update
+
+-- 寫入時把關：drawing_owner 從畫本身複製（前端無法偽造）、畫必須還沒過期、不能給自己
+create or replace function public.guard_like()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  d public.drawings%rowtype;
+begin
+  select * into d from public.drawings where id = new.drawing_id;
+  if not found or d.expires_at <= now() then
+    raise exception 'drawing is not live';
+  end if;
+  if d.user_id = new.liker then
+    raise exception 'cannot heart own drawing';
+  end if;
+  new.drawing_owner := d.user_id;
+  new.created_at := now();
+  return new;
+end;
+$$;
+
+revoke execute on function public.guard_like() from public, anon, authenticated;
+
+drop trigger if exists drawing_likes_guard on public.drawing_likes;
+create trigger drawing_likes_guard
+  before insert on public.drawing_likes
+  for each row execute function public.guard_like();
+
+-- 我收到幾顆、花掉幾顆（買外框）、還剩幾顆。只算自己的。
+-- （花掉的 = 買過的外框價格加總；外框目錄與價格見第 10 節）
+create or replace function public.my_hearts()
+returns table (received int, spent int, available int)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid := auth.uid();
+  r int;
+  sp int;
+begin
+  if uid is null then
+    raise exception 'not signed in';
+  end if;
+  select count(*)::int into r from public.drawing_likes l where l.drawing_owner = uid;
+  select coalesce(sum(c.price), 0)::int into sp
+    from public.frame_unlocks u join public.frame_catalog c on c.id = u.frame_id
+   where u.user_id = uid and u.source = 'purchase';
+  return query select r, sp, r - sp;
+end;
+$$;
+
+-- 我自己的這些畫各收到幾顆愛心（不是我的畫一律不回傳）
+create or replace function public.my_drawing_hearts(ids uuid[])
+returns table (drawing_id uuid, hearts int)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select l.drawing_id, count(*)::int
+    from public.drawing_likes l
+   where l.drawing_owner = auth.uid()
+     and l.drawing_id = any (coalesce(ids, '{}'::uuid[]))
+   group by l.drawing_id;
+$$;
+
+revoke execute on function public.my_hearts() from public, anon;
+revoke execute on function public.my_drawing_hearts(uuid[]) from public, anon;
+grant execute on function public.my_hearts() to authenticated;
+grant execute on function public.my_drawing_hearts(uuid[]) to authenticated;
+
+
+-- ════════════════════════════════════════════════════════════════
+-- 10. 頭像外框
+-- ════════════════════════════════════════════════════════════════
+--  • frame_catalog：20 款外框的 id 與價格（要和 js/frames.js 一致）。kind = 'achievement' 靠成就、'shop' 用愛心買。
+--  • frame_unlocks：誰擁有哪些外框。用戶端不能新增、修改、刪除，只能透過 buy_frame() 與 claim_frame_achievements()。
+--  • profiles.frame 只能設成自己擁有的外框（或 null），由觸發器檢查。
+--  • activity_days：記錄「哪一天做過什麼」（畫會在 24 小時後被清掉，所以另外記），用來判斷連續 7 天與使用天數。
+--      upload        = 上傳畫的那一天（畫的 day，也就是上傳者當地的日期）
+--      comment_other = 在「別人的畫」上留言的那一天（以台灣時間 Asia/Taipei 計算；使用者主要在台灣）
+--      visit         = 打開 App 的那一天（由 claim_frame_achievements 記錄，只接受伺服器日期前後 1 天內）
+create table if not exists public.frame_catalog (
+  id    text primary key,
+  name  text not null,
+  kind  text not null check (kind in ('achievement', 'shop')),
+  price int  not null default 0 check (price >= 0)
+);
+
+alter table public.frame_catalog enable row level security;
+drop policy if exists "frame_catalog: read" on public.frame_catalog;
+create policy "frame_catalog: read" on public.frame_catalog for select to authenticated using (true);
+revoke all on public.frame_catalog from public, anon, authenticated;
+grant select on public.frame_catalog to authenticated;
+
+insert into public.frame_catalog (id, name, kind, price) values
+  ('black',   '黑外框',   'achievement', 0),
+  ('white',   '白外框',   'achievement', 0),
+  ('blue',    '藍外框',   'achievement', 0),
+  ('green',   '綠外框',   'achievement', 0),
+  ('orange',  '橘外框',   'achievement', 0),
+  ('flowers', '花花外框', 'achievement', 0),
+  ('grass',   '草草外框', 'achievement', 0),
+  ('peach',   '蜜桃',     'shop', 3),
+  ('mint',    '薄荷',     'shop', 3),
+  ('milktea', '奶茶',     'shop', 3),
+  ('rainbow', '彩虹拼接', 'shop', 10),
+  ('sunset',  '夕陽',     'shop', 10),
+  ('waves',   '海浪',     'shop', 10),
+  ('lemon',   '檸檬汽水', 'shop', 10),
+  ('purple',  '紫色塗鴉', 'shop', 10),
+  ('palette', '調色盤',   'shop', 30),
+  ('donut',   '甜甜圈',   'shop', 30),
+  ('cat',     '貓耳',     'shop', 30),
+  ('starry',  '星空',     'shop', 30),
+  ('crown',   '王冠',     'shop', 30)
+on conflict (id) do update set name = excluded.name, kind = excluded.kind, price = excluded.price;
+
+create table if not exists public.frame_unlocks (
+  user_id     uuid not null references public.profiles (id) on delete cascade,
+  frame_id    text not null,
+  source      text not null check (source in ('purchase', 'achievement')),
+  unlocked_at timestamptz not null default now(),
+  primary key (user_id, frame_id)
+);
+
+alter table public.frame_unlocks enable row level security;
+drop policy if exists "frame_unlocks: read own" on public.frame_unlocks;
+create policy "frame_unlocks: read own" on public.frame_unlocks
+  for select to authenticated using (user_id = (select auth.uid()));
+revoke all on public.frame_unlocks from public, anon, authenticated;
+grant select on public.frame_unlocks to authenticated;   -- 刻意沒有 insert／update／delete
+
+create table if not exists public.activity_days (
+  user_id uuid not null references public.profiles (id) on delete cascade,
+  kind    text not null check (kind in ('upload', 'comment_other', 'visit')),
+  day     date not null,
+  primary key (user_id, kind, day)
+);
+
+alter table public.activity_days enable row level security;
+drop policy if exists "activity_days: read own" on public.activity_days;
+create policy "activity_days: read own" on public.activity_days
+  for select to authenticated using (user_id = (select auth.uid()));
+revoke all on public.activity_days from public, anon, authenticated;
+grant select on public.activity_days to authenticated;   -- 刻意沒有寫入權限
+
+-- 上傳畫 → 記錄那一天
+create or replace function public.record_upload_day()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.activity_days (user_id, kind, day) values (new.user_id, 'upload', new.day)
+  on conflict do nothing;
+  return new;
+end;
+$$;
+
+revoke execute on function public.record_upload_day() from public, anon, authenticated;
+drop trigger if exists drawings_activity on public.drawings;
+create trigger drawings_activity
+  after insert on public.drawings
+  for each row execute function public.record_upload_day();
+
+-- 在別人的畫上留言 → 記錄那一天（台灣時間）
+create or replace function public.record_comment_day()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if new.author <> new.drawing_owner then
+    insert into public.activity_days (user_id, kind, day)
+    values (new.author, 'comment_other', (now() at time zone 'Asia/Taipei')::date)
+    on conflict do nothing;
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.record_comment_day() from public, anon, authenticated;
+drop trigger if exists drawing_comments_activity on public.drawing_comments;
+create trigger drawing_comments_activity
+  after insert on public.drawing_comments
+  for each row execute function public.record_comment_day();
+
+-- 一次性補資料（可重複執行）：用現有的留言與還在的畫補上過去的日子
+insert into public.activity_days (user_id, kind, day)
+  select c.author, 'comment_other', (c.created_at at time zone 'Asia/Taipei')::date
+    from public.drawing_comments c where c.author <> c.drawing_owner
+on conflict do nothing;
+
+insert into public.activity_days (user_id, kind, day)
+  select d.user_id, 'upload', d.day from public.drawings d
+on conflict do nothing;
+
+-- 設定 profiles.frame 時檢查：只能是 null 或自己擁有的外框；新增個人檔案時一律不能帶外框
+create or replace function public.guard_profile_frame()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if new.frame is null then
+    return new;
+  end if;
+  if tg_op = 'UPDATE' and new.frame is not distinct from old.frame then
+    return new;
+  end if;
+  if tg_op = 'INSERT' or not exists (
+    select 1 from public.frame_unlocks u where u.user_id = new.id and u.frame_id = new.frame
+  ) then
+    raise exception 'frame not owned';
+  end if;
+  return new;
+end;
+$$;
+
+revoke execute on function public.guard_profile_frame() from public, anon, authenticated;
+drop trigger if exists profiles_frame_guard on public.profiles;
+create trigger profiles_frame_guard
+  before insert or update of frame on public.profiles
+  for each row execute function public.guard_profile_frame();
+
+-- 用愛心買外框。回傳 'ok' | 'already_owned' | 'not_enough_hearts' | 'not_for_sale'
+create or replace function public.buy_frame(p_frame text)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid := auth.uid();
+  cat public.frame_catalog%rowtype;
+  got int;
+  sp int;
+begin
+  if uid is null then
+    raise exception 'not signed in';
+  end if;
+  select * into cat from public.frame_catalog where id = p_frame;
+  if not found or cat.kind <> 'shop' then
+    return 'not_for_sale';
+  end if;
+  -- 同一個人同時買只會依序處理，餘額才不會算錯
+  perform pg_advisory_xact_lock(hashtextextended('buy_frame:' || uid::text, 0));
+  if exists (select 1 from public.frame_unlocks where user_id = uid and frame_id = p_frame) then
+    return 'already_owned';
+  end if;
+  select count(*)::int into got from public.drawing_likes where drawing_owner = uid;
+  select coalesce(sum(c.price), 0)::int into sp
+    from public.frame_unlocks u join public.frame_catalog c on c.id = u.frame_id
+   where u.user_id = uid and u.source = 'purchase';
+  if got - sp < cat.price then
+    return 'not_enough_hearts';
+  end if;
+  insert into public.frame_unlocks (user_id, frame_id, source) values (uid, p_frame, 'purchase');
+  return 'ok';
+end;
+$$;
+
+-- 連續 7 天：這個人的某種活動，有沒有出現過連續 7 個日期（不一定要到今天）
+create or replace function public.has_7_day_streak(p_user uuid, p_kind text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+      from (select a.day, a.day - (row_number() over (order by a.day))::int as grp
+              from public.activity_days a
+             where a.user_id = p_user and a.kind = p_kind) t
+     group by t.grp
+    having count(*) >= 7
+  );
+$$;
+
+revoke execute on function public.has_7_day_streak(uuid, text) from public, anon, authenticated;
+
+-- 領取成就外框：記錄「今天有使用」、檢查 7 個條件，回傳「這次新解鎖」的外框 id
+--   black   建立帳號（有帳號就有）
+--   white   設定過忘記密碼的問題（recovery_answers 有資料）
+--   blue    第一次成功上傳畫到雲端（有任何一天的上傳紀錄）
+--   green   留過第一則留言（任何留言，包括自己的畫）
+--   orange  用過 Art Day 超過 3 天（第 4 個不同的日子：上傳、留言、打開 App 的日子合計）
+--   flowers 連續 7 天上傳畫
+--   grass   連續 7 天在別人的畫上留言
+create or replace function public.claim_frame_achievements(p_local_day date default null)
+returns setof text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  uid uuid := auth.uid();
+  fid text;
+  ok boolean;
+begin
+  if uid is null then
+    raise exception 'not signed in';
+  end if;
+  -- 只接受伺服器日期前後 1 天內的「當地日期」（涵蓋各時區，也擋住亂填）
+  if p_local_day is not null and p_local_day between current_date - 1 and current_date + 1 then
+    insert into public.activity_days (user_id, kind, day) values (uid, 'visit', p_local_day)
+    on conflict do nothing;
+  end if;
+
+  for fid in select c.id from public.frame_catalog c where c.kind = 'achievement' order by c.id loop
+    ok := case fid
+      when 'black'   then true
+      when 'white'   then exists (select 1 from public.recovery_answers r where r.user_id = uid)
+      when 'blue'    then exists (select 1 from public.activity_days a where a.user_id = uid and a.kind = 'upload')
+      when 'green'   then exists (select 1 from public.drawing_comments c where c.author = uid)
+      when 'orange'  then (select count(distinct a.day) from public.activity_days a where a.user_id = uid) >= 4
+      when 'flowers' then public.has_7_day_streak(uid, 'upload')
+      when 'grass'   then public.has_7_day_streak(uid, 'comment_other')
+      else false
+    end;
+    if ok then
+      insert into public.frame_unlocks (user_id, frame_id, source) values (uid, fid, 'achievement')
+      on conflict do nothing;
+      if found then
+        return next fid;
+      end if;
+    end if;
+  end loop;
+  return;
+end;
+$$;
+
+revoke execute on function public.buy_frame(text) from public, anon;
+revoke execute on function public.claim_frame_achievements(date) from public, anon;
+grant execute on function public.buy_frame(text) to authenticated;
+grant execute on function public.claim_frame_achievements(date) to authenticated;

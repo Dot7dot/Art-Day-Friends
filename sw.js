@@ -7,7 +7,7 @@
 //  • skipWaiting + clients.claim：新版 service worker 一裝好就接手，不會卡在舊版。
 //
 // 改了這支檔案或要清掉舊快取時，把下面的版本號加一。
-const VERSION = 'artday-v8';
+const VERSION = 'artday-v9';
 const CACHE = `artday-shell-${VERSION}`;
 const NETWORK_TIMEOUT = 6000; // 網路太慢（例如訊號很差）就先給快取
 
@@ -17,7 +17,7 @@ const PRECACHE = [
   'assets/icon.svg', 'assets/icon-180.png', 'assets/icon-192.png', 'assets/icon-512.png',
   'js/app.js', 'js/album.js', 'js/archive.js', 'js/backend-local.js', 'js/backend-supabase.js',
   'js/camera.js', 'js/config.js', 'js/dates.js', 'js/demo-art.js', 'js/drawing-modal.js',
-  'js/icons.js', 'js/idb.js', 'js/image-cache.js', 'js/imaging.js', 'js/pending-import.js', 'js/recovery.js', 'js/sketch.js', 'js/ui.js',
+  'js/icons.js', 'js/idb.js', 'js/image-cache.js', 'js/extras.js', 'js/frames.js', 'js/imaging.js', 'js/pending-import.js', 'js/recovery.js', 'js/sketch.js', 'js/ui.js',
   'vendor/supabase-js-2.117.3.mjs',
 ];
 
