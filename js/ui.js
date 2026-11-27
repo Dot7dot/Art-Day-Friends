@@ -1,6 +1,7 @@
 // 共用 UI 小工具：跳脫、提示、對話框、燈箱、頭像
 
 import { icon } from './icons.js';
+import { frameSvg, FRAME_INNER } from './frames.js';
 
 export function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -148,10 +149,14 @@ export function avatar(profile, size = 40) {
   const initial = [...name.trim()][0] || '?';
   const tint = AVATAR_TINTS[hash(profile?.username || name) % AVATAR_TINTS.length];
   const photo = typeof profile?.avatar === 'string' && /^data:image\/(jpeg|png|webp);base64,/.test(profile.avatar) ? profile.avatar : '';
-  if (photo) {
-    return `<span class="avatar has-img" style="--size:${size}px;--tint:${tint}" aria-hidden="true"><img src="${esc(photo)}" alt="" decoding="async"></span>`;
+  const content = photo ? `<img src="${esc(photo)}" alt="" decoding="async">` : esc(initial.toUpperCase());
+  // 外框：外層尺寸不變（版面不會跑掉），頭像縮在裡面，外框 SVG 畫在外圈
+  const ring = typeof profile?.frame === 'string' ? frameSvg(profile.frame) : '';
+  if (ring) {
+    return `<span class="avatar framed" style="--size:${size}px;--tint:${tint}" aria-hidden="true"><span class="avatar-core${photo ? ' has-img' : ''}" style="--inner:${FRAME_INNER}">${content}</span>${ring}</span>`;
   }
-  return `<span class="avatar" style="--size:${size}px;--tint:${tint}" aria-hidden="true">${esc(initial.toUpperCase())}</span>`;
+  if (photo) return `<span class="avatar has-img" style="--size:${size}px;--tint:${tint}" aria-hidden="true">${content}</span>`;
+  return `<span class="avatar" style="--size:${size}px;--tint:${tint}" aria-hidden="true">${content}</span>`;
 }
 
 // ── 其他 ─────────────────────────────────────────

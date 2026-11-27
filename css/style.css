@@ -550,6 +550,15 @@ textarea.lined::placeholder { color: #b1a79e; }
 }
 .avatar.has-img { overflow: hidden; background: var(--bg); }
 .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* 外框：外層尺寸和沒有外框時一樣；頭像縮在裡面，外框 SVG 畫在外圈 */
+.avatar.framed { position: relative; background: none; border: 0; overflow: visible; font-size: inherit; }
+.avatar-core {
+  width: calc(var(--inner, .74) * 100%); height: calc(var(--inner, .74) * 100%); border-radius: 50%;
+  display: grid; place-items: center; overflow: hidden; background: var(--tint); border: 1px solid var(--line);
+  font-weight: 900; font-size: calc(var(--size) * .42 * var(--inner, .74)); line-height: 1; color: var(--ink);
+}
+.avatar-core.has-img { background: var(--bg); }
+.frame-ring { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
 
 .invite-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; background: var(--paper); }
 .my-id { font-size: 22px; font-weight: 900; overflow-wrap: anywhere; }
@@ -1070,3 +1079,109 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
 }
 .stat b { font-size: 26px; font-weight: 900; line-height: 1.2; }
 .stat span { font-size: 12.5px; color: var(--muted); line-height: 1.4; }
+
+/* ═══ 愛心 ═══════════════════════════════════════════ */
+.post-cell { position: relative; min-width: 0; }
+.post-cell .post-img { width: 100%; }
+.heart-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 36px; min-width: 36px; padding: 0 9px;
+  border-radius: var(--pill); border: var(--lw) solid var(--line); background: rgba(255, 255, 255, .95); color: var(--orange-ink);
+  font: inherit; font-size: 13px; font-weight: 800; cursor: pointer; -webkit-tap-highlight-color: transparent;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.post-cell .heart-btn { position: absolute; right: 8px; bottom: 8px; }
+.heart-btn .ico { transition: transform .15s; }
+.heart-btn:hover { border-color: var(--orange); }
+.heart-btn.on { color: #e5484d; border-color: #f4b6b8; background: #fff4f4; }
+.heart-btn.on .ico { fill: currentColor; }
+.heart-btn.pop .ico { animation: heart-pop .5s cubic-bezier(.3, 1.6, .5, 1); }
+.heart-btn-wide { height: 36px; padding: 0 14px; }
+@keyframes heart-pop { 0% { transform: scale(.6); } 55% { transform: scale(1.5); } 100% { transform: scale(1); } }
+.heart-count {
+  position: absolute; right: 8px; top: 8px; display: inline-flex; align-items: center; gap: 3px; height: 26px; padding: 0 9px;
+  border-radius: var(--pill); background: rgba(255, 255, 255, .94); border: var(--lw) solid #f4b6b8; color: #e5484d;
+  font-size: 12px; font-weight: 800; pointer-events: none;
+}
+.heart-count[hidden] { display: none; }
+.heart-count .ico { fill: currentColor; }
+.heart-own { display: inline-flex; align-items: center; gap: 5px; height: 36px; padding: 0 12px; border-radius: var(--pill); background: #fff4f4; color: #e5484d; font-size: 13px; font-weight: 800; }
+.heart-own .ico { fill: currentColor; }
+.drawing-tools { align-items: center; }
+
+.hearts-line {
+  display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 10px; padding: 10px 14px;
+  border: var(--lw) solid #f4d0d1; border-radius: var(--r); background: #fff8f8; color: var(--ink-2); font-size: 15px;
+}
+.hearts-line[hidden] { display: none; }
+.hearts-line-ico { display: inline-flex; color: #e5484d; }
+.hearts-line-ico .ico { fill: currentColor; }
+.hearts-line b { color: #e5484d; font-weight: 900; }
+
+/* ═══ 更換外框 ═══════════════════════════════════════ */
+.modal-frames { max-width: 560px; }
+@media (min-width: 640px) { .modal-frames { max-width: 600px; } }
+.fp-top { display: flex; align-items: center; gap: 16px; }
+.fp-preview { flex: none; line-height: 0; }
+.fp-info { display: grid; gap: 4px; min-width: 0; }
+.fp-name { font-size: 20px; }
+.fp-hearts { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--ink-2); }
+.fp-hearts .hearts-line-ico { color: #e5484d; }
+.fp-hearts .hearts-line-ico .ico { fill: currentColor; }
+.fp-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 12px; min-height: 44px; }
+.fp-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 400px) { .fp-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (min-width: 640px) { .fp-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+.fp-tile {
+  width: 100%; display: grid; justify-items: center; gap: 3px; padding: 8px 2px 7px; min-width: 0;
+  border: var(--lw) solid var(--line-soft); border-radius: var(--r-sm); background: var(--bg); color: var(--ink); font: inherit; cursor: pointer;
+}
+.fp-tile .avatar { margin-bottom: 2px; }
+.fp-tile.lock .avatar { opacity: .55; filter: grayscale(.35); }
+.fp-tile.sel { border-color: var(--orange); background: var(--paper); box-shadow: 0 0 0 3px rgba(242, 153, 74, .18); }
+.fp-tile.eq { border-color: var(--ok); }
+.fp-tile-name { font-size: 13px; font-weight: 800; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-tile-sub { display: flex; justify-content: center; align-items: center; gap: 2px; min-width: 0; width: 100%; padding: 0 4px; font-size: 11px; color: var(--muted); max-width: 100%; }
+.fp-tile-sub > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-tile.eq .fp-tile-sub { color: var(--ok); font-weight: 800; }
+
+/* 解鎖 */
+.unlock { display: grid; justify-items: center; gap: 10px; text-align: center; }
+.unlock-stage { position: relative; display: grid; place-items: center; width: 100%; height: 170px; }
+.unlock-avatar { display: inline-flex; line-height: 0; animation: unlock-pop .8s cubic-bezier(.3, 1.5, .5, 1) both; }
+.unlock-avatar .frame-ring { animation: ring-spin 1s cubic-bezier(.2, .8, .3, 1) both; transform-origin: 50% 50%; }
+.unlock-text { font-size: 17px; line-height: 1.6; }
+.confetti {
+  position: absolute; left: 50%; top: 50%; width: var(--s); height: var(--s); border-radius: 46% 54% 50% 50%; opacity: 0;
+  animation: confetti-out .9s ease-out both;
+}
+@keyframes unlock-pop { 0% { transform: scale(.2) rotate(-25deg); opacity: 0; } 70% { transform: scale(1.12) rotate(4deg); opacity: 1; } 100% { transform: none; } }
+@keyframes ring-spin { from { transform: rotate(-200deg) scale(.7); } to { transform: none; } }
+@keyframes confetti-out { 0% { transform: translate(-50%, -50%) scale(.3); opacity: 1; } 100% { transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))) scale(1) rotate(160deg); opacity: 0; } }
+
+/* 新功能介紹 */
+.wn-pages { display: grid; }
+.wn-page { grid-area: 1 / 1; display: grid; justify-items: center; gap: 10px; text-align: center; align-content: start; }
+.wn-page.off { visibility: hidden; }
+.wn-page h3 { font-size: 20px; }
+.wn-art { display: flex; align-items: center; justify-content: center; gap: 10px; height: 110px; line-height: 0; }
+.wn-heart { position: relative; color: #e5484d; }
+.wn-heart > .ico { fill: currentColor; width: 70px; height: 70px; animation: heart-pop 1s ease-out both; }
+.wn-heart i { position: absolute; width: 10px; height: 10px; border-radius: 50%; background: #FFB3B6; }
+.wn-heart i:nth-of-type(1) { left: calc(50% - 56px); top: 20px; }
+.wn-heart i:nth-of-type(2) { left: calc(50% + 46px); top: 34px; background: #FFE07A; }
+.wn-heart i:nth-of-type(3) { left: calc(50% + 30px); top: 4px; width: 7px; height: 7px; background: #F29A4C; }
+.wn-dots { display: flex; justify-content: center; gap: 7px; margin-top: 8px; }
+.wn-dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--line-soft); transition: width .2s, background .2s; }
+.wn-dots i.on { width: 22px; border-radius: 8px; background: var(--orange); }
+.wn-foot { justify-content: space-between; margin-top: 14px; }
+.wn-foot .btn[hidden] { display: none; }
+.wn-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; width: 100%; text-align: left; }
+.wn-list li { display: flex; align-items: center; gap: 12px; padding: 3px 10px; border: var(--lw) solid var(--line-soft); border-radius: var(--r-sm); line-height: 1.25; }
+.wn-list span { display: grid; min-width: 0; }
+.wn-list small { color: var(--muted); font-size: 12.5px; }
+.wn-list .avatar { flex: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .heart-btn.pop .ico, .unlock-avatar, .unlock-avatar .frame-ring, .wn-heart > .ico { animation: none; }
+  .confetti { display: none; }
+}

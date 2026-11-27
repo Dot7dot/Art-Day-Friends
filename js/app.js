@@ -12,6 +12,7 @@ import { esc, toast, openModal, confirmDialog, avatar, uuid, debounce, copyText,
 import { openSketchPad } from './sketch.js';
 import { ANIMALS, checkRecoveryInput, SCHOOL_MAX, MSG as RECOVERY_MSG } from './recovery.js';
 import { openDrawingModal, commentHtml, replyTarget } from './drawing-modal.js';
+import { initExtras, startupExtras, claimFrames, heartBtn, heartsOn, loadLiked, toggleHeart, paintHearts, loadMyHearts, heartsLineHtml, framesOn, openFramePicker } from './extras.js';
 import { cameraMode, openCameraModal } from './camera.js';
 import { isIOS, isAndroid, isMobileDevice, isStandalone, albumName, toFile, saveToAlbum, savedMessage, canShareFiles, downloadFiles, getAutoSave, setAutoSave, requestPersistOnce } from './album.js';
 
@@ -54,6 +55,7 @@ function registerServiceWorker() {
 }
 registerServiceWorker();
 
+initExtras(state, () => render());
 const isDemo = () => state.backend?.mode === 'local';
 const inviteLink = (u) => `${location.origin}${location.pathname}#/add/${encodeURIComponent(u)}`;
 const spinner = '<span class="spinner" aria-hidden="true"></span>';
@@ -266,7 +268,7 @@ async function render() {
     return;
   }
   const c = newCtx();
-  if (!state.me) { renderAuth(c); return; }
+  if (!state.me) { state.extrasFor = null; renderAuth(c); return; }
 
   const name = VIEWS[route.name] ? route.name : HOME;
   if (!VIEWS[route.name]) history.replaceState(null, '', `${location.pathname}${location.search}#/${HOME}`);
@@ -275,6 +277,7 @@ async function render() {
   lastRoute = routeKey;
 
   renderShell(name);
+  if (state.extrasFor !== state.me.id) { state.extrasFor = state.me.id; startupExtras(); } // 領取成就外框、第一次顯示新功能介紹
   dailyMaintenance();
   refreshBadge();
   const view = $('#view');
@@ -800,6 +803,7 @@ async function pushDrawing(rec) {
     rec.cloud = 'synced';
     if (sharedUntil) rec.sharedUntil = Date.parse(sharedUntil);
     await archive.putDrawing(rec);
+    claimFrames(); // 第一次上傳 → 藍外框；連續 7 天 → 花花外框
     return true;
   } catch (e) {
     rec.cloud = /上限/.test(e.message) ? 'local' : 'pending';
@@ -977,6 +981,7 @@ function commentActions(mine) {
     load: (id) => loadComments([id], { mine }),
     async add(id, body, replyTo = null) {
       const c = await state.backend.addComment(id, body, replyTo);
+      claimFrames(); // 第一則留言 → 綠外框；連續 7 天留言 → 草草外框
       if (mine) archive.putComment(me.id, c).catch((e) => console.warn(e));
       return c;
     },
@@ -1825,6 +1830,7 @@ function mountMine(slot, c) {
   let kctx = null;
   let drawings = [];
   let counts = new Map();
+  let heartCounts = new Map();
   let processing = 0;
   const api = {
     photo: null,
@@ -1840,6 +1846,24 @@ function mountMine(slot, c) {
     if (!c.alive || list.failed) return;
     counts = countBy(list);
     for (const id of ids) setCmtBadge(slot, id, counts.get(id) || 0);
+  }
+
+  // 每張畫收到幾顆愛心（只有自己看得到）
+  async function refreshHearts() {
+    const ids = drawings.filter((d) => sharing(d) && d.cloud === 'synced').map((d) => d.id);
+    if (!ids.length || !c.alive || !heartsOn()) return;
+    try {
+      heartCounts = await state.backend.myDrawingHearts(ids);
+    } catch (e) {
+      if (e?.code === 'FEATURE_UNSUPPORTED') state.heartsOk = false; else console.warn(e);
+      return;
+    }
+    if (!c.alive) return;
+    for (const id of ids) {
+      const el = slot.querySelector(`[data-hc="${CSS.escape(id)}"]`);
+      const n = heartCounts.get(id) || 0;
+      if (el) { el.hidden = !n; el.lastElementChild.textContent = n; }
+    }
   }
 
   function html(list, note, k) {
@@ -1870,6 +1894,7 @@ function mountMine(slot, c) {
             ${single && d.width && d.height ? `style="aspect-ratio:${d.width}/${d.height}"` : ''}>
             <img src="${k.url(d.blob)}" alt="我的畫">
             ${sharing(d) && d.cloud === 'synced' ? cmtBadge(d.id, counts.get(d.id) || 0) : ''}
+            ${sharing(d) && d.cloud === 'synced' && heartsOn() ? `<span class="heart-count" data-hc="${esc(d.id)}" ${heartCounts.get(d.id) ? '' : 'hidden'} title="收到的愛心（只有你看得到）">${icon('heart', 13)}<span>${heartCounts.get(d.id) || ''}</span></span>` : ''}
             ${shareBadge(d)}
           </button>`;
         }).join('')}
@@ -1898,6 +1923,7 @@ function mountMine(slot, c) {
     kctx?.dispose();
     kctx = k;
     refreshCounts();
+    refreshHearts();
   }
 
   slot.addEventListener('click', (e) => {
@@ -1920,6 +1946,7 @@ function mountMine(slot, c) {
         isOwner: true,
         actions: commentActions(true),
         onCount: (n) => { counts.set(d.id, n); setCmtBadge(slot, d.id, n); },
+        ownHearts: sharing(d) && d.cloud === 'synced' && heartsOn() ? (heartCounts.get(d.id) || 0) : null,
         onSave: () => saveDrawingsToAlbum([{ blob: d.blob, day: d.day, n: di + 1 }]),
         onDownload: () => downloadBlob(d.blob, `art-day-${d.day}-${formatTime(d.createdAt).replace(':', '')}.jpg`),
       });
@@ -2025,6 +2052,7 @@ async function paintFeed(body, c) {
   body.onclick = async (e) => {
     if (onFeedSuggestClick(e)) return;
     const btn = e.target.closest('button');
+    if (btn?.dataset.heart) { toggleHeart(btn.dataset.heart); return; }
     if (btn?.dataset.recoAdd) {
       setBusy(btn, true);
       try { await addFriendFromReco(body, btn.dataset.recoAdd); } catch (err) {
@@ -2058,6 +2086,7 @@ async function paintFeed(body, c) {
         me: state.me,
         isOwner: false,
         onAddFriend: () => addFriendFromReco(body, rid),
+        heartId: id,
       });
       return;
     }
@@ -2070,8 +2099,10 @@ async function paintFeed(body, c) {
       isOwner: false,
       actions: commentActions(false),
       onCount: (n) => setCmtBadge(body, id, n, true),
+      heartId: id,
     });
   };
+  loadLiked([...images.keys()]); // 我按過哪些愛心
 
   // 各張畫的留言數（只有好友的畫；不擋住圖片載入；留言功能還沒設定好時就安靜略過）
   loadComments([...friendImages.keys()]).then((list) => {
@@ -2140,11 +2171,11 @@ function postCard(p, { reco = false } = {}) {
       <div class="post-who"><b>${esc(p.profile.displayName)}${reco ? '<span class="reco-tag">推薦</span>' : ''}</b><span class="muted small">@${esc(p.profile.username)} · ${esc(meta)}</span></div>
     </header>
     ${n ? `<div class="post-grid ${single ? 'single' : ''}">
-      ${p.drawings.map((d) => `<button class="post-img" data-cloud-view="${esc(d.id)}" aria-label="${reco ? '查看大圖' : '查看大圖與留言'}"
+      ${p.drawings.map((d) => `<div class="post-cell"><button class="post-img" data-cloud-view="${esc(d.id)}" aria-label="${reco ? '查看大圖' : '查看大圖與留言'}"
           ${single && d.width && d.height ? `style="aspect-ratio:${d.width}/${d.height}"` : ''}>
           <img data-cloud-id="${esc(d.id)}" alt="${esc(p.profile.displayName)} 的畫">
           ${reco ? '' : cmtBadge(d.id, 0, true)}
-        </button>`).join('')}
+        </button>${heartBtn(d.id)}</div>`).join('')}
     </div>` : ''}
     ${p.note ? `<p class="post-note">${esc(p.note)}</p>` : ''}
     ${reco ? `<div class="post-actions" data-reco-actions="${esc(id)}">
@@ -2769,11 +2800,14 @@ async function viewMe(el, c) {
       </div>
       <div class="profile-actions">
         <button class="btn btn-small" data-avatar>${icon('image', 16)}<span>更換大頭貼</span></button>
+        ${framesOn() ? `<button class="btn btn-small" data-frame>${icon('sparkle', 16)}<span>更換外框</span></button>` : ''}
         <button class="btn btn-small" data-edit-name>${icon('pen', 16)}<span>修改暱稱</span></button>
         ${me.avatar ? `<button class="btn btn-small btn-ghost" data-avatar-remove>移除大頭貼</button>` : ''}
       </div>
       <input type="file" id="avatar-input" accept="image/*" hidden>
     </section>
+
+    <div class="hearts-line" data-hearts-line hidden></div>
 
     <div class="stats">
       <div class="stat"><b>${act.drawingDays.size}</b><span>畫畫的日子</span></div>
@@ -2888,6 +2922,14 @@ async function viewMe(el, c) {
 
   mountNotifications($('#notif-slot', el), c, notifs);
 
+  // 「❤ 收到 N 顆愛心 · 可用 M 顆」：只有自己看得到
+  loadMyHearts().then((h) => {
+    const line = $('[data-hearts-line]', el);
+    if (!h || !c.alive || !line) return;
+    line.innerHTML = heartsLineHtml(h);
+    line.hidden = false;
+  });
+
   // 本機圖片快取（別人的畫）：顯示張數與大小，可以手動清除
   const cacheText = $('[data-imgcache-text]', el);
   const cacheClear = $('[data-imgcache-clear]', el);
@@ -2947,7 +2989,9 @@ async function viewMe(el, c) {
   el.addEventListener('click', async (e) => {
     const b = e.target.closest('button');
     if (!b) return;
-    if (b.hasAttribute('data-avatar')) {
+    if (b.hasAttribute('data-frame')) {
+      openFramePicker();
+    } else if (b.hasAttribute('data-avatar')) {
       avatarInput.click();
     } else if (b.hasAttribute('data-avatar-remove')) {
       setBusy(b, true);
@@ -3028,6 +3072,7 @@ async function viewMe(el, c) {
       await state.backend.signOut();
       state.me = null;
       state.maintainedDay = null;
+      state.extrasFor = null;
       state.incoming = 0;
       badgeAt = 0;
       location.hash = '';
@@ -3087,6 +3132,7 @@ function editRecovery(isSet) {
     setBusy(btn, true, '儲存中…');
     try {
       await state.backend.setRecoveryAnswers(animal, school);
+      claimFrames(); // 白外框
       m.close(true);
       toast('已儲存忘記密碼的問題');
       render();

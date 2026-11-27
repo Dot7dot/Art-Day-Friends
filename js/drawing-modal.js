@@ -3,6 +3,7 @@
 
 import { icon } from './icons.js';
 import { formatTime } from './dates.js';
+import { heartBtn, heartsOn, toggleHeart } from './extras.js';
 import { esc, openModal, confirmDialog, avatar, toast, setBusy } from './ui.js';
 
 export const COMMENT_MAX = 200;
@@ -55,7 +56,9 @@ export function openDrawingModal(o) {
       <div class="drawing-detail">
         <div class="drawing-scroll">
           <figure class="drawing-fig"><img src="${esc(o.src)}" alt="${esc(o.alt || '畫作')}"></figure>
-          ${o.onSave || o.onDownload || o.onAddFriend ? `<div class="drawing-tools">
+          ${o.onSave || o.onDownload || o.onAddFriend || (o.heartId && heartsOn()) || o.ownHearts != null ? `<div class="drawing-tools">
+            ${o.heartId && heartsOn() ? heartBtn(o.heartId, 'heart-btn-wide', '愛心') : ''}
+            ${o.ownHearts != null ? `<span class="heart-own" title="只有你看得到">${icon('heart', 16)}<span>收到 ${o.ownHearts} 顆愛心</span></span>` : ''}
             ${o.onAddFriend ? `<span class="drawing-friend" data-friend><button class="btn btn-small btn-primary" data-addfriend>${icon('userPlus', 18)}<span>加好友</span></button></span>` : ''}
             ${o.onSave ? `<button class="btn btn-small" data-save>${icon('image', 18)}<span>存到相簿</span></button>` : ''}
             ${o.onDownload ? `<button class="btn btn-small" data-download>${icon('download', 18)}<span>下載</span></button>` : ''}
@@ -76,6 +79,7 @@ export function openDrawingModal(o) {
   m.body.querySelector('[data-download]')?.addEventListener('click', o.onDownload);
   // 直接呼叫（不包 async／await），分享表才拿得到點擊的啟動狀態
   m.body.querySelector('[data-save]')?.addEventListener('click', () => o.onSave());
+  m.body.querySelector('[data-heart]')?.addEventListener('click', () => toggleHeart(o.heartId));
   const addBtn = m.body.querySelector('[data-addfriend]');
   addBtn?.addEventListener('click', async () => {
     setBusy(addBtn, true);

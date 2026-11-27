@@ -66,6 +66,7 @@ const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, 
 const mapProfile = (p) => p && {
   id: p.id, username: p.username, displayName: p.display_name, avatar: p.avatar || null,
   ...('share_public' in p ? { sharePublic: p.share_public } : {}),
+  ...('frame' in p ? { frame: p.frame || null } : {}), // 沒有 frame 鍵 = 資料庫還沒更新（或這個來源沒回傳外框）
 };
 
 // 資料庫還沒執行最新 schema.sql（profiles 沒有 avatar 欄位）：42703 = 欄位不存在，PGRST204 = PostgREST 找不到欄位
@@ -73,6 +74,9 @@ const isMissingAvatarCol = (e) => !!e && /avatar/i.test(e.message || '')
   && (/^(42703|PGRST204)$/.test(e.code || '') || /column|schema cache/i.test(e.message || ''));
 // 同上：profiles 沒有 share_public 欄位（推薦貼文還沒開啟）
 const isMissingShareCol = (e) => !!e && /share_public/i.test(e.message || '')
+  && (/^(42703|PGRST204)$/.test(e.code || '') || /column|schema cache/i.test(e.message || ''));
+// 同上：profiles 沒有 frame 欄位（外框還沒開啟）
+const isMissingFrameCol = (e) => !!e && /frame/i.test(e.message || '')
   && (/^(42703|PGRST204)$/.test(e.code || '') || /column|schema cache/i.test(e.message || ''));
 const SHARE_UNSUPPORTED = Object.assign(
   new Error('推薦功能還沒開啟：請網站管理員到 Supabase SQL Editor 重新執行最新的 supabase/schema.sql'),
@@ -108,11 +112,13 @@ export async function createSupabaseBackend(url, anonKey) {
   // self = 這是「我自己」的檔案：多查 share_public（推薦設定）；欄位不存在時同樣退回
   let avatarOk = true;
   let shareOk = true;
-  const profileCols = (self) => ['id, username, display_name', avatarOk && 'avatar', self && shareOk && 'share_public'].filter(Boolean).join(', ');
+  let frameOk = true;
+  const profileCols = (self) => ['id, username, display_name', avatarOk && 'avatar', frameOk && 'frame', self && shareOk && 'share_public'].filter(Boolean).join(', ');
   async function profileQuery(make, { self = false } = {}) {
     let res = await make(profileCols(self));
-    for (let i = 0; i < 2 && res.error; i++) {
+    for (let i = 0; i < 3 && res.error; i++) {
       if (avatarOk && isMissingAvatarCol(res.error)) avatarOk = false;
+      else if (frameOk && isMissingFrameCol(res.error)) frameOk = false;
       else if (shareOk && isMissingShareCol(res.error)) shareOk = false;
       else break;
       res = await make(profileCols(self));
@@ -221,7 +227,7 @@ export async function createSupabaseBackend(url, anonKey) {
     },
 
     /** displayName、avatar（data URL，或 null 代表移除）、sharePublic（出現在推薦）都是選填，沒給的就不動 */
-    async updateProfile({ displayName, avatar, sharePublic } = {}) {
+    async updateProfile({ displayName, avatar, sharePublic, frame } = {}) {
       const patch = {};
       if (displayName !== undefined) patch.display_name = displayName;
       if (sharePublic !== undefined) {
@@ -232,14 +238,21 @@ export async function createSupabaseBackend(url, anonKey) {
         if (!avatarOk) throw AVATAR_UNSUPPORTED;
         patch.avatar = avatar;
       }
+      if (frame !== undefined) {
+        if (!frameOk) throw FEATURE_UNSUPPORTED('外框');
+        patch.frame = frame;
+      }
       let p;
       try {
         p = await profileQuery((cols) => sb.from('profiles').update(patch).eq('id', me.id).select(cols).single(), { self: true });
       } catch (e) {
         if (avatar !== undefined && isMissingAvatarCol(e.cause)) { avatarOk = false; throw AVATAR_UNSUPPORTED; }
         if (sharePublic !== undefined && isMissingShareCol(e.cause)) { shareOk = false; throw SHARE_UNSUPPORTED; }
+        if (frame !== undefined && isMissingFrameCol(e.cause)) { frameOk = false; throw FEATURE_UNSUPPORTED('外框'); }
+        if (frame !== undefined && /not owned|frame/i.test(e.cause?.message || '')) throw new Error('這個外框還沒解鎖');
         throw e;
       }
+      if (frame !== undefined && !frameOk) throw FEATURE_UNSUPPORTED('外框');
       if (sharePublic !== undefined && !shareOk) throw SHARE_UNSUPPORTED; // 查詢途中才發現沒有欄位：更新並沒有生效
       me = mapSelf(p);
       return me;
@@ -357,7 +370,7 @@ export async function createSupabaseBackend(url, anonKey) {
         const note = ns.find((n) => n.user_id === r.user_id);
         const times = [...mine.map((d) => d.created_at), note?.updated_at].filter(Boolean).sort();
         return {
-          profile: mapProfile({ id: r.user_id, username: r.username, display_name: r.display_name, avatar: r.avatar }),
+          profile: mapProfile({ id: r.user_id, username: r.username, display_name: r.display_name, avatar: r.avatar, ...('frame' in r ? { frame: r.frame } : {}) }),
           mutualCount: r.mutual_count || 0,
           drawings: mine.map((d) => ({ id: d.id, width: d.width, height: d.height, createdAt: d.created_at, expiresAt: d.expires_at })),
           note: note?.note || '',
@@ -588,6 +601,76 @@ export async function createSupabaseBackend(url, anonKey) {
       const { data, error } = await sb.rpc('poke_friend', { target: targetId });
       if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('戳好友') : friendly(error);
       return String(data);
+    },
+
+    // ── 愛心（只有畫的主人看得到自己的數量；資料庫還沒更新時丟出 code 'FEATURE_UNSUPPORTED'）──
+
+    /** 這些畫裡，我按過愛心的 id（Set） */
+    async likedIds(ids) {
+      const list = [...new Set(ids)];
+      const out = new Set();
+      for (const part of chunk(list, 60)) {
+        const { data, error } = await sb.from('drawing_likes').select('drawing_id').in('drawing_id', part);
+        if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('愛心') : friendly(error);
+        for (const r of data || []) out.add(r.drawing_id);
+      }
+      return out;
+    },
+
+    /** on = true 按愛心、false 收回；回傳最後的狀態 */
+    async setHeart(drawingId, on) {
+      const q = on
+        ? await sb.from('drawing_likes').insert({ drawing_id: drawingId })
+        : await sb.from('drawing_likes').delete().eq('drawing_id', drawingId).eq('liker', me.id);
+      const { error } = q;
+      if (error && !(on && error.code === '23505')) {
+        if (isMissingSchema(error)) throw FEATURE_UNSUPPORTED('愛心');
+        if (error.code === '42501' || /not live|own drawing/i.test(error.message || '')) {
+          throw Object.assign(new Error('這張畫已經超過 24 小時，或不能給愛心'), { cause: error, code: 'HEART_REFUSED' });
+        }
+        throw friendly(error);
+      }
+      return on;
+    },
+
+    /** 我收到的愛心：{ received, spent, available } */
+    async myHearts() {
+      const { data, error } = await sb.rpc('my_hearts');
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('愛心') : friendly(error);
+      const r = Array.isArray(data) ? data[0] : data;
+      return { received: r?.received || 0, spent: r?.spent || 0, available: r?.available || 0 };
+    },
+
+    /** 我自己的這些畫各收到幾顆愛心（Map：畫 id → 數量） */
+    async myDrawingHearts(ids) {
+      const list = [...new Set(ids)];
+      if (!list.length) return new Map();
+      const { data, error } = await sb.rpc('my_drawing_hearts', { ids: list });
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('愛心') : friendly(error);
+      return new Map((data || []).map((r) => [r.drawing_id, r.hearts]));
+    },
+
+    // ── 外框 ──
+
+    /** 我擁有的外框：{ id: 'purchase' | 'achievement' } */
+    async frameStatus() {
+      const { data, error } = await sb.from('frame_unlocks').select('frame_id, source');
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('外框') : friendly(error);
+      return Object.fromEntries((data || []).map((r) => [r.frame_id, r.source]));
+    },
+
+    /** 'ok' | 'already_owned' | 'not_enough_hearts' | 'not_for_sale' */
+    async buyFrame(id) {
+      const { data, error } = await sb.rpc('buy_frame', { p_frame: id });
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('外框') : friendly(error);
+      return String(data);
+    },
+
+    /** 檢查成就並記錄今天有使用；回傳這次新解鎖的外框 id 陣列 */
+    async claimFrameAchievements(localDay) {
+      const { data, error } = await sb.rpc('claim_frame_achievements', { p_local_day: localDay });
+      if (error) throw isMissingSchema(error) ? FEATURE_UNSUPPORTED('外框') : friendly(error);
+      return (data || []).map((x) => (typeof x === 'string' ? x : Object.values(x)[0]));
     },
 
     /** 把自己已過期（超過 24 小時）的雲端副本刪掉，並順手清掉所有人已過期的資料；沒到期的不動 */
