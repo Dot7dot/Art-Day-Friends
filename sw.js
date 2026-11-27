@@ -7,7 +7,7 @@
 //  • skipWaiting + clients.claim：新版 service worker 一裝好就接手，不會卡在舊版。
 //
 // 改了這支檔案或要清掉舊快取時，把下面的版本號加一。
-const VERSION = 'artday-v9';
+const VERSION = 'artday-v10';
 const CACHE = `artday-shell-${VERSION}`;
 const NETWORK_TIMEOUT = 6000; // 網路太慢（例如訊號很差）就先給快取
 

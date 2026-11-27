@@ -354,13 +354,39 @@ const FRAMES_DEF = [
   {
     id: 'crown', name: '王冠', group: 'shop', price: 30,
     draw: () => {
-      let s = ring('#A98BE8', wob(45, [[1.6, 2, 5], [1.1, 3, 1.2], [0.8, 5, 2]]), { r: 35.4, ox: 0.5, oy: 0.4 });
-      s += arc(wob(41, [[1, 3, 1]]), 20, 120, 6, '#C9B6F6') + arc(wob(41.4, [[0.9, 2, 1.5]]), 190, 262, 5, '#C9B6F6');
-      s += `<g transform="rotate(-16 50 14)">
-        ${poly([[29, 23], [27.5, 7.5], [39, 15.5], [50, 2.5], [61, 15.5], [72.5, 7.5], [71, 23]], '#FFD54A', '#E9A92C', 1.8)}
-        <rect x="29" y="18.4" width="42" height="5.6" rx="2.8" fill="#F2B72D"/>
-        ${dot(27.6, 6.6, 2.7, '#FFF1A6')}${dot(50, 2.2, 2.9, '#FFF1A6')}${dot(72.4, 6.6, 2.7, '#FFF1A6')}
-        ${dot(50, 13.6, 2.5, '#F0585A')}${dot(38.5, 20.9, 1.6, '#4EA7E8')}${dot(61.5, 20.9, 1.6, '#5BC07D')}</g>`;
+      // 草草外框的金色版：一圈尖尖的葉冠 + 高光（只用實心形狀，不用漸層 id）
+      const edge = '#C99A1E';
+      let s = ring('#F2C94C', wob(42.6, [[1.1, 2, 2], [0.7, 3, 0.7]]), { r: 35.4, ox: -0.5, oy: 0.4 }, `stroke="${edge}" stroke-width=".9" stroke-linejoin="round"`);
+      const r = rng(21);
+      const cols = ['#E9B52F', '#F2C94C', '#F8DB75'];
+      let blades = '';
+      let glints = '';
+      const tufts = [-90, -60, -30, 0, 30, 60, 90, 120, 150, 180, 210, 240];
+      tufts.forEach((a, i) => {
+        const [x, y] = pt(40.6, a);
+        const bl = 3;
+        for (let k = 0; k < bl; k++) {
+          const tilt = (k - 1) * 27 + (r() - 0.5) * 5;
+          const len = (k === 1 ? 12.4 : 9.4) + r() * 1.2;
+          blades += blade(x, y, a + tilt, len, 5, cols[(i + k) % 3], (k - 1) * 0.12);
+          // 左上方的尖尖上一小道反光
+          const up = Math.cos(rad(a + tilt - 225));
+          if (up > 0.55 && k % 2 === 0) {
+            const [bx, by] = pt(len * 0.3, a + tilt, x, y);
+            const [tx, ty] = pt(len * 0.68, a + tilt - 3, x, y);
+            glints += `<path d="M${n1(bx)} ${n1(by)}L${n1(tx)} ${n1(ty)}" stroke="#FFF9D6" stroke-width="1.1" stroke-linecap="round" fill="none"/>`;
+          }
+        }
+      });
+      s += `<g stroke="${edge}" stroke-width=".5" stroke-linejoin="round">${blades}</g>`;
+      // 環上的反光：左上一道長的、旁邊一小段，右下一點暗金
+      s += arc(41.2, 188, 262, 2.6, '#FFF6C8', { extra: 'stroke-opacity=".95"' });
+      s += arc(41.2, 270, 292, 2.2, '#FFFFFF');
+      s += arc(41.4, 20, 70, 2.2, '#D9A521', { extra: 'stroke-opacity=".8"' });
+      s += arc(41.4, 122, 160, 2.2, '#D9A521', { extra: 'stroke-opacity=".8"' });
+      s += glints;
+      s += dotAt(41.2, 178, 1.2, '#FFFFFF') + dotAt(41.2, 300, 1, '#FFFFFF') + dotAt(41, 40, 0.9, '#FFF6C8');
+      s += star(...pt(45.4, 225), 4.6, '#FFFFFF', -90, 4) + star(...pt(45, 15), 3.4, '#FFFDE8', -90, 4);
       return s;
     },
   },
