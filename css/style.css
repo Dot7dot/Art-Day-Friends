@@ -1141,7 +1141,11 @@ button.cal-cell:focus-visible { outline: 2px solid var(--orange); outline-offset
 .fp-tile.eq { border-color: var(--ok); }
 .fp-tile-name { font-size: 13px; font-weight: 800; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fp-tile-sub { display: flex; justify-content: center; align-items: center; gap: 2px; min-width: 0; width: 100%; padding: 0 4px; font-size: 11px; color: var(--muted); max-width: 100%; }
-.fp-tile-sub > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-tile-sub { align-items: flex-start; line-height: 1.3; text-align: center; }
+.fp-tile-sub > span { white-space: normal; overflow-wrap: anywhere; }
+.fp-tile-sub .ico { flex: none; margin-top: 1px; }
+.fp-grid > li { display: flex; }
+.fp-tile { height: 100%; align-content: start; }
 .fp-tile.eq .fp-tile-sub { color: var(--ok); font-weight: 800; }
 
 /* 解鎖 */
