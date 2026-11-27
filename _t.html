@@ -1,0 +1,9 @@
+<!doctype html><html><head><link rel="stylesheet" href="/css/style.css"><style>body{background:#fff;padding:12px;font:12px sans-serif}.row{display:flex;gap:18px;align-items:center;margin:10px 0}</style></head><body><div id=o></div>
+<script type=module>
+import {avatar} from '/js/ui.js';
+const ids=['crown','grass','starry','lemon'];
+let h='';
+for(const sz of [150,96,32]){h+='<div class=row>'+ids.map(f=>avatar({username:'amy',displayName:'Amy',frame:f},sz)).join('')+'</div>';}
+h+='<div class=row>'+Array.from({length:8},()=>avatar({username:'b',frame:'crown'},48)).join('')+'</div>';
+document.getElementById('o').innerHTML=h;document.title='ok';
+</script></body></html>
